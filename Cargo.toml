@@ -1,6 +1,6 @@
 [package]
 name = "qlean"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["jl.jiang <jiangjl9807@gmail.com>"]
 categories = ["development-tools::testing", "virtualization"]
 description = "A system-level isolation testing library based on QEMU/KVM."
@@ -34,5 +34,6 @@ tracing = { version = "0.1.43", features = ["log"] }
 walkdir = "2.5.0"
 
 [dev-dependencies]
+serial_test = "3.3.1"
 tempfile = "3.24.0"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "local-time"] }

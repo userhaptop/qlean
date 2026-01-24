@@ -48,6 +48,24 @@ pub struct ShaSum {
     pub sha_type: ShaType,
 }
 
+/// Parses SHA512SUMS format and returns the hash for an exact filename match.
+///
+/// # Arguments
+/// * `checksums_text` - The content of a SHA512SUMS file
+/// * `filename` - The exact filename to search for (e.g., "debian-13-generic-amd64.qcow2")
+///
+/// # Returns
+/// The SHA512 hash if found, or None if no exact match exists
+pub fn find_sha512_for_file(checksums_text: &str, filename: &str) -> Option<String> {
+    checksums_text.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        let fname = parts.next()?;
+
+        (fname == filename).then(|| hash.to_string())
+    })
+}
+
 impl<A: ImageAction + std::default::Default> ImageMeta<A> {
     /// Create a new image by downloading and extracting
     pub async fn create(name: &str) -> Result<Self> {
@@ -200,15 +218,17 @@ impl ImageAction for Debian {
             .await
             .with_context(|| format!("failed to read SHA512SUMS text from {}", checksums_url))?;
 
-        let expected_sha512 = checksums_text
-            .lines()
-            .find(|line| line.contains(name))
-            .and_then(|line| line.split_whitespace().next())
-            .with_context(|| format!("failed to find {}.qcow2 in SHA512SUMS", name))?
-            .to_string();
+        let target_filename = format!("{}.qcow2", name);
+        let expected_sha512 = find_sha512_for_file(&checksums_text, &target_filename)
+            .with_context(|| {
+                format!(
+                    "failed to find SHA512 checksum entry for {} in remote SHA512SUMS file",
+                    target_filename
+                )
+            })?;
 
         let dirs = QleanDirs::new()?;
-        let image_path = dirs.images.join(name).join(format!("{}.qcow2", name));
+        let image_path = dirs.images.join(name).join(&target_filename);
 
         let download_url = format!(
             "https://cloud.debian.org/images/cloud/trixie/latest/{}.qcow2",
@@ -234,7 +254,7 @@ impl ImageAction for Debian {
 
         // Verify the downloaded file matches the expected checksum
         anyhow::ensure!(
-            computed_sha512.eq_ignore_ascii_case(&expected_sha512),
+            computed_sha512.to_lowercase() == expected_sha512.to_lowercase(),
             "downloaded image checksum mismatch: expected {}, got {}",
             expected_sha512,
             computed_sha512
@@ -428,4 +448,75 @@ pub async fn get_sha512(path: &PathBuf) -> Result<String> {
         .to_string();
 
     Ok(sha512)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Debian, ImageAction, find_sha512_for_file, get_sha512};
+    use crate::utils::QleanDirs;
+    use anyhow::Result;
+    use serial_test::serial;
+
+    #[test]
+    fn test_find_sha512_for_exact_filename() {
+        let checksums = "\
+748f52b959f63352e1e121508cedeae2e66d3e90be00e6420a0b8b9f14a0f84dc54ed801fb5be327866876268b808543465b1613c8649efeeb5f987ff9df1549  debian-13-generic-amd64.json
+\
+f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea67709154d84220059672758508afbb0691c41ba8aa6d76818d89d65  debian-13-generic-amd64.qcow2
+\
+9fd031ef5dda6479c8536a0ab396487113303f4924a2941dc4f9ef1d36376dfb8ae7d1ca5f4dfa65ad155639e9a5e61093c686a8e85b51d106c180bce9ac49bc  debian-13-generic-amd64.raw";
+
+        // Should match exact qcow2 filename, not json with same prefix
+        let result = find_sha512_for_file(checksums, "debian-13-generic-amd64.qcow2");
+        assert_eq!(
+            result,
+            Some("f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea67709154d84220059672758508afbb0691c41ba8aa6d76818d89d65".to_string())
+        );
+
+        // Should match json file exactly
+        let result = find_sha512_for_file(checksums, "debian-13-generic-amd64.json");
+        assert_eq!(
+            result,
+            Some("748f52b959f63352e1e121508cedeae2e66d3e90be00e6420a0b8b9f14a0f84dc54ed801fb5be327866876268b808543465b1613c8649efeeb5f987ff9df1549".to_string())
+        );
+
+        // Should not match partial names
+        let result = find_sha512_for_file(checksums, "debian-13-generic-amd64");
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[ignore]
+    async fn download_real_qcow2_and_validate_checksum() -> Result<()> {
+        let name = "debian-13-generic-amd64";
+        let target = format!("{name}.qcow2");
+
+        let dirs = QleanDirs::new()?;
+        let image_dir = dirs.images.join(name);
+        tokio::fs::create_dir_all(&image_dir).await?;
+        let qcow_path = image_dir.join(&target);
+        if qcow_path.exists() {
+            tokio::fs::remove_file(&qcow_path).await?;
+        }
+
+        let debian = Debian::default();
+        debian.download(name).await?;
+
+        let checksums_url = "https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS";
+        let checksums_text = reqwest::get(checksums_url).await?.text().await?;
+        let expected = find_sha512_for_file(&checksums_text, &target)
+            .expect("missing qcow2 checksum entry in SHA512SUMS");
+
+        let computed = get_sha512(&qcow_path).await?;
+
+        // Clean up downloaded image before assertion to ensure cleanup happens even on failure
+        if qcow_path.exists() {
+            tokio::fs::remove_file(&qcow_path).await?;
+        }
+
+        assert_eq!(computed.to_lowercase(), expected.to_lowercase());
+
+        Ok(())
+    }
 }
