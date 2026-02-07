@@ -50,6 +50,13 @@ pub struct ShaSum {
 }
 
 /// Parses SHA512SUMS format and returns the hash for an exact filename match.
+///
+/// # Arguments
+/// * `checksums_text` - The content of a SHA512SUMS file
+/// * `filename` - The exact filename to search for (e.g., "debian-13-generic-amd64.qcow2")
+///
+/// # Returns
+/// The SHA512 hash if found, or None if no exact match exists
 pub fn find_sha512_for_file(checksums_text: &str, filename: &str) -> Option<String> {
     checksums_text.lines().find_map(|line| {
         let mut parts = line.split_whitespace();
@@ -249,7 +256,7 @@ impl ImageAction for Debian {
         }
 
         let computed_sha512 = get_sha512(&image_path).await?;
-
+        // Verify the downloaded file matches the expected checksum
         anyhow::ensure!(
             computed_sha512.to_lowercase() == expected_sha512.to_lowercase(),
             "downloaded image checksum mismatch: expected {}, got {}",
@@ -348,7 +355,7 @@ impl ImageAction for Debian {
         Distro::Debian
     }
 }
-
+/// Wrapper enum for different Image types
 // ---------------------------------------------------------------------------
 // Ubuntu - uses pre-extracted kernel/initrd from official cloud images
 // ---------------------------------------------------------------------------
@@ -436,31 +443,33 @@ async fn download_file(url: &str, dest: &PathBuf) -> Result<()> {
 #[derive(Debug)]
 pub enum Image {
     Debian(ImageMeta<Debian>),
+    // Add more distros as needed
     Ubuntu(ImageMeta<Ubuntu>),
 }
 
 impl Image {
+    /// Get the underlying name regardless of distro
     pub fn name(&self) -> &str {
         match self {
             Image::Debian(img) => &img.name,
             Image::Ubuntu(img) => &img.name,
         }
     }
-
+    /// Get the underlying image path regardless of distro
     pub fn path(&self) -> &PathBuf {
         match self {
             Image::Debian(img) => &img.path,
             Image::Ubuntu(img) => &img.path,
         }
     }
-
+    /// Get the kernel path regardless of distro
     pub fn kernel(&self) -> &PathBuf {
         match self {
             Image::Debian(img) => &img.kernel,
             Image::Ubuntu(img) => &img.kernel,
         }
     }
-
+    /// Get the initrd path regardless of distro
     pub fn initrd(&self) -> &PathBuf {
         match self {
             Image::Debian(img) => &img.initrd,
@@ -475,7 +484,7 @@ pub async fn create_image(distro: Distro, name: &str) -> Result<Image> {
         Distro::Debian => {
             let image = ImageMeta::<Debian>::create(name).await?;
             Ok(Image::Debian(image))
-        }
+        }// Add more distros as needed
         Distro::Ubuntu => {
             let image = ImageMeta::<Ubuntu>::create(name).await?;
             Ok(Image::Ubuntu(image))
@@ -548,19 +557,19 @@ mod tests {
 f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea67709154d84220059672758508afbb0691c41ba8aa6d76818d89d65  debian-13-generic-amd64.qcow2
 \
 9fd031ef5dda6479c8536a0ab396487113303f4924a2941dc4f9ef1d36376dfb8ae7d1ca5f4dfa65ad155639e9a5e61093c686a8e85b51d106c180bce9ac49bc  debian-13-generic-amd64.raw";
-
+        // Should match exact qcow2 filename, not json with same prefix
         let result = find_sha512_for_file(checksums, "debian-13-generic-amd64.qcow2");
         assert_eq!(
             result,
             Some("f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea67709154d84220059672758508afbb0691c41ba8aa6d76818d89d65".to_string())
         );
-
+        // Should match json file exactly
         let result = find_sha512_for_file(checksums, "debian-13-generic-amd64.json");
         assert_eq!(
             result,
             Some("748f52b959f63352e1e121508cedeae2e66d3e90be00e6420a0b8b9f14a0f84dc54ed801fb5be327866876268b808543465b1613c8649efeeb5f987ff9df1549".to_string())
         );
-
+        // Should not match partial names
         let result = find_sha512_for_file(checksums, "debian-13-generic-amd64");
         assert_eq!(result, None);
     }
@@ -595,7 +604,7 @@ f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea6770915
             .expect("missing qcow2 checksum entry in SHA512SUMS");
 
         let computed = get_sha512(&qcow_path).await?;
-
+        // Clean up downloaded image before assertion to ensure cleanup happens even on failure
         if qcow_path.exists() {
             tokio::fs::remove_file(&qcow_path).await?;
         }
