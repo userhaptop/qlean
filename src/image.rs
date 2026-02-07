@@ -484,7 +484,7 @@ pub async fn create_image(distro: Distro, name: &str) -> Result<Image> {
         Distro::Debian => {
             let image = ImageMeta::<Debian>::create(name).await?;
             Ok(Image::Debian(image))
-        }// Add more distros as needed
+        } // Add more distros as needed
         Distro::Ubuntu => {
             let image = ImageMeta::<Ubuntu>::create(name).await?;
             Ok(Image::Ubuntu(image))
