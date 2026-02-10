@@ -14,9 +14,18 @@ mod qemu;
 mod ssh;
 mod utils;
 
+// Re-export public types and functions
+pub use image::CustomImageConfig;
 pub use image::Distro;
 pub use image::Image;
+pub use image::ImageSource;
+pub use image::ShaType;
+pub use image::compute_sha256_streaming;
+pub use image::compute_sha512_streaming;
+pub use image::create_custom_image;
 pub use image::create_image;
+pub use image::get_sha256;
+pub use image::get_sha512;
 pub use machine::{Machine, MachineConfig};
 pub use pool::MachinePool;
 
