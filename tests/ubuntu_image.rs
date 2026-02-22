@@ -20,7 +20,7 @@ async fn test_ubuntu_image_creation() -> Result<()> {
         return Ok(());
     }
 
-    // Ubuntu uses pre-extracted kernel/initrd.
+    // Ubuntu  uses pre-extracted kernel/initrd.
     let image = tokio::time::timeout(
         Duration::from_secs(15 * 60),
         create_image(Distro::Ubuntu, "ubuntu-noble-cloudimg"),
