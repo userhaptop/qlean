@@ -123,16 +123,29 @@ impl CommandExt for tokio::process::Command {
     }
 }
 
+/// Ensure host prerequisites for running virtual machines.
+///
+/// IMPORTANT: This intentionally does **not** require libguestfs tools.
+/// Some images (e.g., Ubuntu) ship pre-extracted kernel/initrd and can boot
+/// without `guestfish`/`virt-copy-out`.
 pub async fn ensure_prerequisites() -> Result<()> {
     check_command_available("qemu-system-x86_64").await?;
     check_command_available("qemu-img").await?;
     check_command_available("sha256sum").await?;
     check_command_available("sha512sum").await?;
     check_command_available("xorriso").await?;
-    check_command_available("guestfish").await?;
-    check_command_available("virt-copy-out").await?;
     check_command_available("virsh").await?;
     ensure_network().await?;
+    Ok(())
+}
+
+/// Ensure prerequisites for extracting kernel/initrd from disk images.
+///
+/// This is only required for distros/custom modes that need libguestfs-based
+/// extraction (guestfish/virt-copy-out).
+pub async fn ensure_extraction_prerequisites() -> Result<()> {
+    check_command_available("guestfish").await?;
+    check_command_available("virt-copy-out").await?;
     Ok(())
 }
 

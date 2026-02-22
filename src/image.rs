@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256, Sha512};
 use tokio::{fs::File, io::AsyncWriteExt};
 use tracing::{debug, warn};
 
-use crate::utils::QleanDirs;
+use crate::utils::{QleanDirs, ensure_extraction_prerequisites};
 
 pub trait ImageAction {
     /// Download the image from remote source
@@ -270,17 +270,7 @@ async fn resolve_latest_fedora_cloud_qcow2() -> Result<ResolvedRemote> {
 
     let (qcow2_name, checksum_name) = parse_fedora_cloud_listing(&listing_html, &ver)?;
 
-    // Use the first good base to fetch CHECKSUM (hash should match across mirrors).
-    let checksum_url = format!("{}{}", good_bases[0], checksum_name);
-    let checksum_text = fetch_text(&checksum_url).await?;
-    let sha256 = find_hash_for_file(&checksum_text, &qcow2_name).with_context(|| {
-        format!(
-            "could not find hash for {} in {}",
-            qcow2_name, checksum_name
-        )
-    })?;
-
-    // Build download URLs. Prefer bases where listing worked, but also try the
+    // Build base URLs. Prefer bases where listing worked, but also try the
     // full candidate set as a fallback (a mirror may block directory listing
     // but still serve the file).
     let mut bases = good_bases;
@@ -289,12 +279,48 @@ async fn resolve_latest_fedora_cloud_qcow2() -> Result<ResolvedRemote> {
             bases.push(c.clone());
         }
     }
+
+    // Fetch CHECKSUM across mirrors too. Relying on a single mirror defeats
+    // the multi-mirror resilience we provide for the qcow2 download.
+    let sha256 = fetch_fedora_checksum_sha256(&bases, &checksum_name, &qcow2_name).await?;
+
     let urls = bases
         .into_iter()
         .map(|base| format!("{}{}", base, qcow2_name))
         .collect::<Vec<_>>();
 
     Ok(ResolvedRemote { urls, sha256 })
+}
+
+async fn fetch_fedora_checksum_sha256(
+    bases: &[String],
+    checksum_name: &str,
+    qcow2_name: &str,
+) -> Result<String> {
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for base in bases {
+        let checksum_url = format!("{}{}", base, checksum_name);
+        match fetch_text(&checksum_url).await {
+            Ok(text) => {
+                if let Some(sha) = find_hash_for_file(&text, qcow2_name) {
+                    return Ok(sha);
+                }
+
+                last_err = Some(anyhow::anyhow!(
+                    "checksum file {} did not contain hash for {}",
+                    checksum_url,
+                    qcow2_name
+                ));
+            }
+            Err(e) => {
+                debug!("Fedora CHECKSUM fetch failed for {}: {:#}", checksum_url, e);
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("failed to fetch Fedora CHECKSUM from mirrors")))
 }
 
 fn parse_fedora_cloud_listing(listing_html: &str, ver: &str) -> Result<(String, String)> {
@@ -625,7 +651,7 @@ async fn download_or_copy_with_hash(
         ImageSource::Url(url) => {
             // Reuse cached download if it matches, otherwise overwrite.
             if dest.exists() {
-                let existing = match hash_type {
+                let existing = match &hash_type {
                     ShaType::Sha256 => compute_sha256_streaming(dest).await,
                     ShaType::Sha512 => compute_sha512_streaming(dest).await,
                 };
@@ -636,7 +662,7 @@ async fn download_or_copy_with_hash(
                 }
             }
 
-            let computed = download_with_hash(url, dest, hash_type).await?;
+            let computed = download_with_hash(url, dest, hash_type.clone()).await?;
             anyhow::ensure!(
                 computed.to_lowercase() == expected_hash.to_lowercase(),
                 "hash mismatch: expected {}, got {}",
@@ -919,6 +945,8 @@ impl ImageAction for Debian {
     }
 
     async fn extract(&self, name: &str) -> Result<(PathBuf, PathBuf)> {
+        ensure_extraction_prerequisites().await?;
+
         let file_name = format!("{}.qcow2", name);
         let dirs = QleanDirs::new()?;
         let image_dir = dirs.images.join(name);
@@ -1108,6 +1136,8 @@ impl ImageAction for Fedora {
     }
 
     async fn extract(&self, name: &str) -> Result<(PathBuf, PathBuf)> {
+        ensure_extraction_prerequisites().await?;
+
         let file_name = format!("{}.qcow2", name);
         let dirs = QleanDirs::new()?;
         let image_dir = dirs.images.join(name);
@@ -1237,6 +1267,8 @@ impl ImageAction for Arch {
     }
 
     async fn extract(&self, name: &str) -> Result<(PathBuf, PathBuf)> {
+        ensure_extraction_prerequisites().await?;
+
         let file_name = format!("{}.qcow2", name);
         let dirs = QleanDirs::new()?;
         let image_dir = dirs.images.join(name);
@@ -1407,6 +1439,7 @@ impl ImageAction for Custom {
         }
 
         // Otherwise, try to extract using guestfish
+        ensure_extraction_prerequisites().await?;
         let file_name = format!("{}.qcow2", name);
 
         let output = tokio::process::Command::new("guestfish")
