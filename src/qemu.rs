@@ -31,15 +31,18 @@ pub struct QemuLaunchParams {
     pub is_init: bool,
     pub cancel_token: CancellationToken,
     pub mac_address: String,
+    /// Optional host-forwarded TCP port for SSH (used as a fallback when vsock is unavailable).
+    pub ssh_tcp_port: Option<u16>,
 }
 
 pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
     // Prepare QEMU command
     let mut qemu_cmd = tokio::process::Command::new("qemu-system-x86_64");
+
     qemu_cmd
         // Decrease idle CPU usage
         .args(["-machine", "hpet=off"])
-        // SSH port forwarding
+        // Vsock device (preferred transport)
         .args([
             "-device",
             &format!(
@@ -61,19 +64,70 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
             ),
         ])
         // No GUI
-        .arg("-nographic")
-        // Network
-        .args(["-netdev", "bridge,id=net0,br=qlbr0"])
-        .args([
-            "-device",
-            &format!("virtio-net-pci,netdev=net0,mac={}", params.mac_address),
-        ])
-        // Memory and CPUs
+        .arg("-nographic");
+
+    // ---------------------------------------------------------------------
+    // Network
+    // Prefer bridged networking for parity with "real" hosts, but fall back to
+    // user-mode networking (slirp) when bridging is unavailable (common on WSL2
+    // or hosts without qemu bridge ACL configured).
+    //
+    // When using user-mode networking, we rely on hostfwd for SSH TCP fallback.
+    // ---------------------------------------------------------------------
+    let bridge_name = "qlbr0";
+    let ssh_port = params.ssh_tcp_port;
+    let want_bridge = !is_wsl() && has_iface(bridge_name) && bridge_conf_allows(bridge_name);
+
+    if want_bridge {
+        qemu_cmd
+            .args(["-netdev", &format!("bridge,id=net0,br={bridge_name}")])
+            .args([
+                "-device",
+                &format!("virtio-net-pci,netdev=net0,mac={}", params.mac_address),
+            ]);
+
+        // Optional user-mode networking with host port forwarding for SSH fallback.
+        // This provides a TCP escape hatch even when vsock is unreliable.
+        if let Some(port) = ssh_port {
+            qemu_cmd
+                .args([
+                    "-netdev",
+                    &format!("user,id=net1,hostfwd=tcp:127.0.0.1:{}-:22", port),
+                ])
+                .args(["-device", "virtio-net-pci,netdev=net1"]);
+        }
+    } else {
+        if is_wsl() {
+            info!(
+                "WSL detected: disabling bridged networking and using user-mode networking + hostfwd for SSH."
+            );
+        } else {
+            warn!(
+                "Bridged networking is unavailable (missing /etc/qemu/bridge.conf allow, or bridge interface not present). Falling back to user-mode networking + hostfwd."
+            );
+        }
+
+        let port = ssh_port.ok_or_else(|| {
+            anyhow::anyhow!("user-mode networking fallback requires ssh_tcp_port to be set")
+        })?;
+
+        qemu_cmd
+            .args([
+                "-netdev",
+                &format!("user,id=net0,hostfwd=tcp:127.0.0.1:{}-:22", port),
+            ])
+            .args([
+                "-device",
+                &format!("virtio-net-pci,netdev=net0,mac={}", params.mac_address),
+            ]);
+    }
+
+    // Memory and CPUs
+    qemu_cmd
         .args(["-m", &params.config.mem.to_string()])
         .args(["-smp", &params.config.core.to_string()])
         // Output redirection
         .args(["-serial", "mon:stdio"]);
-
     if params.is_init {
         // Seed ISO
         qemu_cmd.args([
@@ -164,4 +218,42 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
     let _ = tokio::join!(stdout_task, stderr_task);
 
     result
+}
+
+fn is_wsl() -> bool {
+    // Best-effort detection for WSL. We avoid hard failures if files are missing.
+    let osrelease = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    if osrelease.to_lowercase().contains("microsoft") {
+        return true;
+    }
+    let version = std::fs::read_to_string("/proc/version").unwrap_or_default();
+    version.to_lowercase().contains("microsoft")
+}
+
+fn bridge_conf_allows(bridge: &str) -> bool {
+    // qemu-bridge-helper enforces an ACL file (commonly /etc/qemu/bridge.conf).
+    // If the file is missing or doesn't allow the bridge, QEMU will fail with:
+    // "failed to parse default acl file `/etc/qemu/bridge.conf`" or "bridge helper failed".
+    let conf = match std::fs::read_to_string("/etc/qemu/bridge.conf") {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    for line in conf.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Supported entries: "allow <bridge>".
+        if let Some(rest) = line.strip_prefix("allow ") {
+            let b = rest.trim();
+            if b == "all" || b == bridge {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn has_iface(name: &str) -> bool {
+    std::path::Path::new(&format!("/sys/class/net/{name}")).exists()
 }

@@ -17,11 +17,12 @@ use russh::{
 use russh_sftp::{client::SftpSession, protocol::OpenFlags};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 use tokio_vsock::{VsockAddr, VsockStream};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 #[derive(Clone, Debug)]
 pub struct PersistedSshKeypair {
@@ -144,9 +145,8 @@ impl Session {
                     // This is "No such device" but for some reason Rust doesn't have an IO
                     // ErrorKind for it. Meh.
                     if now.elapsed() > timeout {
-                        error!(
-                            "Reached timeout trying to connect to virtual machine via SSH, aborting"
-                        );
+                        // Don't log this as an error here: higher-level logic may fall back to TCP.
+                        warn!("Timeout connecting to VM via vsock");
                         bail!("Timeout");
                     }
                     continue;
@@ -154,12 +154,16 @@ impl Session {
                 Err(ref e) => match e.kind() {
                     ErrorKind::TimedOut
                     | ErrorKind::ConnectionRefused
-                    | ErrorKind::ConnectionReset => {
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::NetworkUnreachable
+                    | ErrorKind::AddrNotAvailable => {
                         if now.elapsed() > timeout {
-                            error!(
-                                "Reached timeout trying to connect to virtual machine via SSH, aborting"
+                            // Higher-level logic may fall back to TCP; keep this at warn level.
+                            warn!("Timeout while connecting to VM via vsock");
+                            bail!(
+                                "Timeout while connecting to VM via vsock.\n\
+Hint: Qlean uses vhost-vsock for SSH. Ensure /dev/vhost-vsock exists and the hypervisor provides a working vsock path."
                             );
-                            bail!("Timeout");
                         }
                         continue;
                     }
@@ -179,9 +183,7 @@ impl Session {
                         // for some time.
                         ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset => {
                             if now.elapsed() > timeout {
-                                error!(
-                                    "Reached timeout trying to connect to virtual machine via SSH, aborting"
-                                );
+                                warn!("Timeout establishing SSH over vsock");
                                 bail!("Timeout");
                             }
                         }
@@ -193,9 +195,7 @@ impl Session {
                 }
                 Err(russh::Error::Disconnect) => {
                     if now.elapsed() > timeout {
-                        error!(
-                            "Reached timeout trying to connect to virtual machine via SSH, aborting"
-                        );
+                        warn!("Timeout establishing SSH over vsock (disconnect loop)");
                         bail!("Timeout");
                     }
                 }
@@ -354,20 +354,141 @@ impl Session {
             .await?;
         Ok(())
     }
+
+    /// Connect to an SSH server via TCP (used as a fallback when vsock is unavailable or flaky).
+    async fn connect_tcp(
+        privkey: PrivateKey,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+        cancel_token: CancellationToken,
+    ) -> Result<Self> {
+        let config = russh::client::Config {
+            keepalive_interval: Some(Duration::from_secs(5)),
+            ..<_>::default()
+        };
+        let config = Arc::new(config);
+        let sh = SshClient {};
+
+        let now = Instant::now();
+        info!("🔑 Connecting via tcp {}:{}", host, port);
+
+        let addr = format!("{}:{}", host, port);
+        let mut session = loop {
+            if cancel_token.is_cancelled() {
+                info!("SSH connection cancelled during connect loop");
+                bail!("SSH connection cancelled");
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let stream = match TcpStream::connect(&addr).await {
+                Ok(s) => s,
+                Err(e) => match e.kind() {
+                    ErrorKind::TimedOut
+                    | ErrorKind::ConnectionRefused
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::NetworkUnreachable
+                    | ErrorKind::AddrNotAvailable => {
+                        if now.elapsed() > timeout {
+                            bail!(
+                                "Timeout while connecting to VM via tcp {}\nHint: Ensure QEMU host port forwarding is enabled and the guest sshd is running.",
+                                addr
+                            );
+                        }
+                        continue;
+                    }
+                    _ => {
+                        error!("Unhandled TCP connect error: {e}");
+                        bail!("Unknown error");
+                    }
+                },
+            };
+
+            match russh::client::connect_stream(config.clone(), stream, sh.clone()).await {
+                Ok(x) => break x,
+                Err(russh::Error::IO(ref e)) => match e.kind() {
+                    ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset => {
+                        if now.elapsed() > timeout {
+                            bail!("Timeout");
+                        }
+                    }
+                    _ => {
+                        error!("Unhandled error occurred: {e}");
+                        bail!("Unknown error");
+                    }
+                },
+                Err(russh::Error::Disconnect) => {
+                    if now.elapsed() > timeout {
+                        bail!("Timeout");
+                    }
+                }
+                Err(e) => {
+                    error!("Unhandled error occurred: {e}");
+                    bail!("Unknown error");
+                }
+            }
+        };
+
+        debug!("Authenticating via SSH");
+        let auth_res = session
+            .authenticate_publickey("root", PrivateKeyWithHashAlg::new(Arc::new(privkey), None))
+            .await?;
+        if !auth_res.success() {
+            bail!("Authentication (with publickey) failed");
+        }
+        Ok(Self {
+            session,
+            sftp: None,
+        })
+    }
 }
 
 /// Connect SSH and run a command that checks whether the system is ready for operation.
 pub async fn connect_ssh(
     cid: u32,
+    tcp_port: Option<u16>,
     timeout: Duration,
     keypair: PersistedSshKeypair,
     cancel_token: CancellationToken,
 ) -> Result<Session> {
     let privkey = PrivateKey::from_openssh(&keypair.privkey_str)?;
 
-    // Session is a wrapper around a russh client, defined down below.
-    let mut ssh = Session::connect(privkey, cid, 22, timeout, cancel_token.clone()).await?;
-    info!("✅ Connected");
+    // Prefer vsock, but don't wait the full timeout if we have a TCP fallback.
+    // On some hosts (notably WSL2), vsock can be flaky/unreachable even when /dev/vhost-vsock
+    // exists. In those cases we want to fall back quickly to TCP host forwarding.
+    let vsock_timeout = if tcp_port.is_some() {
+        std::cmp::min(timeout, Duration::from_secs(15))
+    } else {
+        timeout
+    };
+
+    let mut ssh = match Session::connect(
+        privkey.clone(),
+        cid,
+        22,
+        vsock_timeout,
+        cancel_token.clone(),
+    )
+    .await
+    {
+        Ok(s) => {
+            info!("✅ Connected via vsock");
+            s
+        }
+        Err(e) => {
+            if let Some(port) = tcp_port {
+                warn!("Vsock SSH failed ({e}). Falling back to tcp 127.0.0.1:{port}");
+                let s =
+                    Session::connect_tcp(privkey, "127.0.0.1", port, timeout, cancel_token.clone())
+                        .await?;
+                info!("✅ Connected via tcp");
+                s
+            } else {
+                return Err(e);
+            }
+        }
+    };
 
     // First we'll wait until the system has fully booted up.
     let is_running_exitcode = ssh

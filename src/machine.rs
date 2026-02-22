@@ -35,6 +35,8 @@ pub struct Machine {
     /// SSH session
     ssh: Option<Session>,
     cid: u32,
+    /// Optional host-forwarded TCP port for SSH (used as a fallback when vsock is unavailable).
+    ssh_tcp_port: u16,
     /// QEMU process ID
     pid: Option<u32>,
     /// Indicates whether QEMU is expected to exit.
@@ -135,6 +137,13 @@ impl Machine {
         // Get a free CID
         let cid = get_free_cid(&dirs.runs, &run_dir)?;
 
+        // Reserve an ephemeral local TCP port for SSH host forwarding.
+        // We don't keep the listener open; the goal is just to select a port that is very
+        // likely to be free. The QEMU command will fail loudly if there is a race.
+        let ssh_tcp_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .map(|l| l.local_addr().map(|a| a.port()))
+            .map_err(|e| anyhow::anyhow!("Failed to reserve TCP port for SSH hostfwd: {e}"))??;
+
         // Prepare cloud-init config
         let meta_data = MetaData {
             instance_id: format!("VM-{}", &machine_id),
@@ -188,6 +197,7 @@ impl Machine {
             keypair: ssh_keypair,
             ssh: None,
             cid,
+            ssh_tcp_port,
             pid: None,
             qemu_should_exit: Arc::new(AtomicBool::new(false)),
             ssh_cancel_token: None,
@@ -597,6 +607,7 @@ impl Machine {
             vmid: self.id.to_owned(),
             is_init,
             mac_address: self.mac_address.to_owned(),
+            ssh_tcp_port: Some(self.ssh_tcp_port),
             cancel_token: self
                 .ssh_cancel_token
                 .as_ref()
@@ -606,16 +617,25 @@ impl Machine {
         };
 
         let kvm_available = KVM_AVAILABLE.get().copied().unwrap_or(false);
+        // SSH reachability can be slow on first boot (cloud-init + sshd startup), especially on
+        // slower disks or under nested virtualization (e.g. WSL2).
+        // Use a generous timeout so E2E tests reflect real readiness rather than flakiness.
         let ssh_timeout = if kvm_available {
-            Duration::from_secs(60)
+            Duration::from_secs(180)
         } else {
             // Give more time if KVM is not available
-            Duration::from_secs(180)
+            Duration::from_secs(300)
         };
+
+        info!(
+            "🔌 SSH transports: prefer vsock cid={} port=22, tcp fallback 127.0.0.1:{}",
+            self.cid, self.ssh_tcp_port
+        );
 
         let qemu_handle = tokio::spawn(launch_qemu(qemu_params));
         let ssh_handle = tokio::spawn(connect_ssh(
             self.cid,
+            Some(self.ssh_tcp_port),
             ssh_timeout,
             self.keypair.to_owned(),
             self.ssh_cancel_token

@@ -4,21 +4,27 @@ use serial_test::serial;
 use std::{str, time::Duration};
 
 mod common;
+mod guestfish;
 use common::{should_run_vm_tests, tracing_subscriber_init};
+use guestfish::has_guestfish_tools;
 
 #[tokio::test]
 #[serial]
-async fn test_ubuntu_image_creation() -> Result<()> {
+async fn test_arch_image_startup_flow() -> Result<()> {
     tracing_subscriber_init();
 
     if !should_run_vm_tests() {
         return Ok(());
     }
 
-    // Ubuntu uses pre-extracted kernel/initrd.
+    // `has_guestfish_tools` prints an actionable SKIP reason on failure.
+    if !has_guestfish_tools() {
+        return Ok(());
+    }
+
     let image = tokio::time::timeout(
-        Duration::from_secs(15 * 60),
-        create_image(Distro::Ubuntu, "ubuntu-noble-cloudimg"),
+        Duration::from_secs(25 * 60),
+        create_image(Distro::Arch, "arch-cloudimg"),
     )
     .await??;
 
@@ -28,7 +34,7 @@ async fn test_ubuntu_image_creation() -> Result<()> {
 
     // Full startup flow validation (mirrors single_machine.rs::hello)
     let config = MachineConfig::default();
-    tokio::time::timeout(Duration::from_secs(5 * 60), async {
+    tokio::time::timeout(Duration::from_secs(8 * 60), async {
         with_machine(&image, &config, |vm| {
             Box::pin(async {
                 let result = vm.exec("whoami").await?;

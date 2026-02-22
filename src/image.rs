@@ -5,7 +5,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use tokio::{fs::File, io::AsyncWriteExt};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::utils::QleanDirs;
 
@@ -41,7 +41,7 @@ pub enum Distro {
     Custom,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone)]
 pub enum ShaType {
     Sha256,
     Sha512,
@@ -54,7 +54,7 @@ pub struct ShaSum {
 }
 
 /// Source of a file: URL or local file path
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ImageSource {
     Url(String),
     LocalPath(PathBuf),
@@ -63,7 +63,7 @@ pub enum ImageSource {
 /// Configuration for custom images - supports two modes:
 /// 1. Image only (requires guestfish for extraction)
 /// 2. Image + pre-extracted kernel/initrd (WSL-friendly)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CustomImageConfig {
     // Image file (required)
     pub image_source: ImageSource,
@@ -93,6 +93,286 @@ pub fn find_sha512_for_file(checksums_text: &str, filename: &str) -> Option<Stri
 
         (fname == filename).then(|| hash.to_string())
     })
+}
+
+/// Parse a checksum file and return the hash for a given filename.
+///
+/// Supports common formats:
+/// 1) "<hex>  <filename>"
+/// 2) "SHA256 (<filename>) = <hex>" / "SHA512 (<filename>) = <hex>"
+pub fn find_hash_for_file(checksums_text: &str, filename: &str) -> Option<String> {
+    // Format 1: "<hex>  <filename>"
+    if let Some(h) = checksums_text.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        let fname = parts.next()?;
+        (fname == filename).then(|| hash.to_string())
+    }) {
+        return Some(h);
+    }
+
+    // Format 2: "SHA256 (<filename>) = <hex>" / "SHA512 (<filename>) = <hex>"
+    for line in checksums_text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("SHA256 (")
+            && let Some(rest) = rest.strip_prefix(filename)
+            && let Some(rest) = rest.strip_prefix(") = ")
+        {
+            return Some(rest.trim().to_string());
+        }
+
+        if let Some(rest) = line.strip_prefix("SHA512 (")
+            && let Some(rest) = rest.strip_prefix(filename)
+            && let Some(rest) = rest.strip_prefix(") = ")
+        {
+            return Some(rest.trim().to_string());
+        }
+    }
+
+    None
+}
+
+async fn fetch_text(url: &str) -> Result<String> {
+    // Keep metadata fetches snappy: if a mirror is slow/hung, we fall back.
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("qlean/0.2 (image-fetch)")
+        .build()
+        .with_context(|| "failed to build HTTP client")?;
+
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("failed to GET {}", url))?;
+    let status = resp.status();
+    anyhow::ensure!(status.is_success(), "GET {} failed: {}", url, status);
+
+    resp.text()
+        .await
+        .with_context(|| format!("failed reading body from {}", url))
+}
+
+// ---------------------------------------------------------------------------
+// Fedora/Arch "latest stable" resolvers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct ResolvedRemote {
+    /// Candidate URLs to try in order. Mirrors can hang; we retry/fallback.
+    urls: Vec<String>,
+    sha256: String,
+}
+
+/// Query endoflife.date for the latest maintained Fedora release number.
+///
+/// This endpoint is stable and returns structured JSON. We select the first
+/// release entry where `isMaintained=true` and `isEol=false`.
+async fn resolve_latest_fedora_release() -> Result<String> {
+    #[derive(Deserialize)]
+    struct EolResp {
+        result: EolResult,
+    }
+    #[derive(Deserialize)]
+    struct EolResult {
+        releases: Vec<EolRelease>,
+    }
+    #[derive(Deserialize)]
+    struct EolRelease {
+        name: String,
+        #[serde(default, rename = "isEol")]
+        is_eol: bool,
+        #[serde(default, rename = "isMaintained")]
+        is_maintained: bool,
+    }
+
+    // Public JSON API documented on https://endoflife.date/fedora
+    let url = "https://endoflife.date/api/v1/products/fedora/";
+    let body = fetch_text(url).await?;
+    let parsed: EolResp =
+        serde_json::from_str(&body).with_context(|| "failed to parse Fedora release JSON")?;
+
+    let latest = parsed
+        .result
+        .releases
+        .into_iter()
+        .find(|r| r.is_maintained && !r.is_eol)
+        .map(|r| r.name)
+        .with_context(|| "could not determine latest maintained Fedora release")?;
+
+    Ok(latest)
+}
+
+/// Resolve the latest Fedora Cloud Base Generic qcow2 URL and its SHA256.
+///
+/// Implementation strategy:
+/// 1) Determine the latest maintained Fedora version.
+/// 2) Fetch an HTML directory listing from one of several known mirrors.
+/// 3) Parse the directory listing to locate the *exact* qcow2 filename and
+///    the corresponding CHECKSUM file name.
+/// 4) Download the CHECKSUM file and extract the SHA256 for the qcow2.
+async fn resolve_latest_fedora_cloud_qcow2() -> Result<ResolvedRemote> {
+    let ver = resolve_latest_fedora_release().await?;
+
+    // Mirror directory patterns differ. We try a small set of mirrors known to
+    // provide HTML listings. We keep this list short to reduce fragility.
+    // Order matters: prefer official redirector first, then a couple of mirrors
+    // that typically provide directory listings.
+    let candidates = [
+        format!(
+            "https://download.fedoraproject.org/pub/fedora/linux/releases/{}/Cloud/x86_64/images/",
+            ver
+        ),
+        format!(
+            "https://ftp2.osuosl.org/pub/fedora/linux/releases/{}/Cloud/x86_64/images/",
+            ver
+        ),
+        format!(
+            "https://mirrors.oit.uci.edu/fedora/linux/releases/{}/Cloud/x86_64/images/",
+            ver
+        ),
+        format!(
+            "https://mirrors.telepoint.bg/fedora/releases/{}/Cloud/x86_64/images/",
+            ver
+        ),
+        format!(
+            "https://mirrors.kernel.org/fedora/releases/{}/Cloud/x86_64/images/",
+            ver
+        ),
+    ];
+
+    // Collect all mirrors where we can fetch a usable listing. We'll parse once
+    // and then try downloads across all mirrors.
+    let mut good_bases: Vec<String> = Vec::new();
+    let mut listing_html: Option<String> = None;
+    for u in &candidates {
+        match fetch_text(u).await {
+            Ok(text) => {
+                if text.contains("Fedora-Cloud-Base-Generic") && text.contains("CHECKSUM") {
+                    good_bases.push(u.clone());
+                    if listing_html.is_none() {
+                        listing_html = Some(text);
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("Fedora listing fetch failed for {}: {:#}", u, e);
+            }
+        }
+    }
+
+    anyhow::ensure!(
+        !good_bases.is_empty(),
+        "failed to fetch Fedora Cloud images listing from mirrors"
+    );
+    let listing_html = listing_html.unwrap();
+
+    let (qcow2_name, checksum_name) = parse_fedora_cloud_listing(&listing_html, &ver)?;
+
+    // Use the first good base to fetch CHECKSUM (hash should match across mirrors).
+    let checksum_url = format!("{}{}", good_bases[0], checksum_name);
+    let checksum_text = fetch_text(&checksum_url).await?;
+    let sha256 = find_hash_for_file(&checksum_text, &qcow2_name).with_context(|| {
+        format!(
+            "could not find hash for {} in {}",
+            qcow2_name, checksum_name
+        )
+    })?;
+
+    // Build download URLs. Prefer bases where listing worked, but also try the
+    // full candidate set as a fallback (a mirror may block directory listing
+    // but still serve the file).
+    let mut bases = good_bases;
+    for c in &candidates {
+        if !bases.iter().any(|b| b == c) {
+            bases.push(c.clone());
+        }
+    }
+    let urls = bases
+        .into_iter()
+        .map(|base| format!("{}{}", base, qcow2_name))
+        .collect::<Vec<_>>();
+
+    Ok(ResolvedRemote { urls, sha256 })
+}
+
+fn parse_fedora_cloud_listing(listing_html: &str, ver: &str) -> Result<(String, String)> {
+    // Parse filename candidates.
+    // Listings generally contain only one compose, so the first match is fine.
+    let qcow2_prefix = format!("Fedora-Cloud-Base-Generic-{}-", ver);
+    let qcow2_suffix = ".x86_64.qcow2";
+    let mut qcow2_name: Option<String> = None;
+    let mut checksum_name: Option<String> = None;
+
+    for token in listing_html
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'))
+    {
+        if qcow2_name.is_none() && token.starts_with(&qcow2_prefix) && token.ends_with(qcow2_suffix)
+        {
+            qcow2_name = Some(token.to_string());
+        }
+        if checksum_name.is_none()
+            && token.starts_with(&format!("Fedora-Cloud-{}-", ver))
+            && token.ends_with("-x86_64-CHECKSUM")
+        {
+            checksum_name = Some(token.to_string());
+        }
+        if qcow2_name.is_some() && checksum_name.is_some() {
+            break;
+        }
+    }
+
+    let qcow2_name = qcow2_name
+        .with_context(|| "could not locate Fedora Cloud Base Generic qcow2 filename in listing")?;
+    let checksum_name = checksum_name
+        .with_context(|| "could not locate Fedora Cloud CHECKSUM filename in listing")?;
+
+    Ok((qcow2_name, checksum_name))
+}
+
+/// Resolve the latest Arch cloud image URL and SHA256.
+///
+/// Arch publishes stable "latest" URLs plus a sidecar .SHA256 file.
+async fn resolve_latest_arch_cloudimg() -> Result<ResolvedRemote> {
+    // Multiple mirrors; any could stall. We fetch SHA256 from the first
+    // available mirror (sidecar is identical across mirrors).
+    let bases = [
+        "https://geo.mirror.pkgbuild.com/images/latest",
+        "https://mirrors.kernel.org/archlinux/images/latest",
+        "https://mirror.rackspace.com/archlinux/images/latest",
+    ];
+    let filename = "Arch-Linux-x86_64-cloudimg.qcow2";
+
+    let mut sha_text: Option<String> = None;
+    let mut good_bases: Vec<String> = Vec::new();
+    for base in &bases {
+        let sha_url = format!("{}/{}.SHA256", base, filename);
+        match fetch_text(&sha_url).await {
+            Ok(t) => {
+                good_bases.push(base.to_string());
+                if sha_text.is_none() {
+                    sha_text = Some(t);
+                }
+            }
+            Err(e) => debug!("Arch SHA256 fetch failed for {}: {:#}", sha_url, e),
+        }
+    }
+
+    anyhow::ensure!(
+        !good_bases.is_empty(),
+        "failed to fetch Arch cloud image SHA256 from mirrors"
+    );
+
+    let sha_text = sha_text.unwrap();
+    let sha256 = find_hash_for_file(&sha_text, filename)
+        .with_context(|| "could not parse Arch .SHA256 file")?;
+
+    let urls = good_bases
+        .into_iter()
+        .map(|base| format!("{}/{}", base, filename))
+        .collect::<Vec<_>>();
+    Ok(ResolvedRemote { urls, sha256 })
 }
 
 // ---------------------------------------------------------------------------
@@ -164,23 +444,67 @@ pub async fn download_with_hash(
     dest_path: &PathBuf,
     hash_type: ShaType,
 ) -> Result<String> {
+    // Keep a temp file to avoid leaving a partially-downloaded blob behind.
+    let tmp_path = dest_path.with_extension("part");
+
     debug!("Downloading {} to {}", url, dest_path.display());
 
-    let response = reqwest::get(url)
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(20))
+        // Do NOT set a short global timeout for large images; we handle stalls
+        // with an idle timeout on the stream.
+        .user_agent("qlean/0.2 (image-download)")
+        .build()
+        .with_context(|| "failed to build HTTP client")?;
+
+    let response = client
+        .get(url)
+        .send()
         .await
         .with_context(|| format!("failed to download from {}", url))?;
 
-    let mut file = File::create(dest_path)
+    let status = response.status();
+    anyhow::ensure!(status.is_success(), "GET {} failed: {}", url, status);
+
+    // Ensure destination directory exists.
+    if let Some(parent) = tmp_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create dir {}", parent.display()))?;
+    }
+
+    // Start fresh on each attempt.
+    let _ = tokio::fs::remove_file(&tmp_path).await;
+
+    let mut file = File::create(&tmp_path)
         .await
-        .with_context(|| format!("failed to create file at {}", dest_path.display()))?;
+        .with_context(|| format!("failed to create file at {}", tmp_path.display()))?;
 
     let mut stream = response.bytes_stream();
+    let idle = std::time::Duration::from_secs(30);
+    let mut downloaded: u64 = 0;
+    let mut last_report: u64 = 0;
+    // Report download progress in reasonably small increments. On slower links (or in CI/WSL),
+    // 64MiB can take long enough that the test runner prints a scary "running over 60 seconds"
+    // warning with no other output.
+    let report_step: u64 = 16 * 1024 * 1024; // 16 MiB
 
     let hash = match hash_type {
         ShaType::Sha256 => {
             let mut h = Sha256::new();
-            while let Some(chunk) = stream.next().await {
+            loop {
+                let next = tokio::time::timeout(idle, stream.next())
+                    .await
+                    .with_context(|| {
+                        format!("download stalled for {} (>{:?} without data)", url, idle)
+                    })?;
+                let Some(chunk) = next else { break };
                 let chunk = chunk.with_context(|| "failed to read chunk")?;
+                downloaded += chunk.len() as u64;
+                if downloaded - last_report >= report_step {
+                    last_report = downloaded;
+                    debug!("Downloading {}: {} MiB", url, downloaded / (1024 * 1024));
+                }
                 h.update(&chunk);
                 file.write_all(&chunk)
                     .await
@@ -190,8 +514,19 @@ pub async fn download_with_hash(
         }
         ShaType::Sha512 => {
             let mut h = Sha512::new();
-            while let Some(chunk) = stream.next().await {
+            loop {
+                let next = tokio::time::timeout(idle, stream.next())
+                    .await
+                    .with_context(|| {
+                        format!("download stalled for {} (>{:?} without data)", url, idle)
+                    })?;
+                let Some(chunk) = next else { break };
                 let chunk = chunk.with_context(|| "failed to read chunk")?;
+                downloaded += chunk.len() as u64;
+                if downloaded - last_report >= report_step {
+                    last_report = downloaded;
+                    debug!("Downloading {}: {} MiB", url, downloaded / (1024 * 1024));
+                }
                 h.update(&chunk);
                 file.write_all(&chunk)
                     .await
@@ -202,7 +537,81 @@ pub async fn download_with_hash(
     };
 
     file.flush().await.with_context(|| "failed to flush file")?;
+
+    // Atomically move into place.
+    tokio::fs::rename(&tmp_path, dest_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to move {} -> {}",
+                tmp_path.display(),
+                dest_path.display()
+            )
+        })?;
+
     Ok(hash)
+}
+
+/// Try downloading a remote file from multiple candidate URLs.
+///
+/// Mirrors can hang mid-transfer; we apply an idle timeout and move on.
+pub async fn download_with_hash_multi(
+    urls: &[String],
+    dest_path: &PathBuf,
+    hash_type: ShaType,
+    expected_hex: Option<&str>,
+) -> Result<(String, String)> {
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for (idx, url) in urls.iter().enumerate() {
+        // If a cached file exists and matches expected, short-circuit.
+        if let Some(expected) = expected_hex
+            && dest_path.exists()
+        {
+            // Avoid moving `hash_type` (non-Copy) so it can be reused for mirror retries.
+            let computed = match &hash_type {
+                ShaType::Sha256 => compute_sha256_streaming(dest_path).await,
+                ShaType::Sha512 => compute_sha512_streaming(dest_path).await,
+            };
+
+            if let Ok(h) = computed
+                && h.eq_ignore_ascii_case(expected)
+            {
+                debug!("Using cached file at {}", dest_path.display());
+                return Ok((h, "(cached)".to_string()));
+            }
+        }
+
+        debug!("Download attempt {}/{}: {}", idx + 1, urls.len(), url);
+        match download_with_hash(url, dest_path, hash_type.clone()).await {
+            Ok(h) => {
+                if let Some(expected) = expected_hex
+                    && !h.eq_ignore_ascii_case(expected)
+                {
+                    warn!(
+                        "hash mismatch from {}: expected {}, got {}",
+                        url, expected, h
+                    );
+                    last_err = Some(anyhow::anyhow!(
+                        "hash mismatch from {}: expected {}, got {}",
+                        url,
+                        expected,
+                        h
+                    ));
+                    // continue to next mirror
+                    continue;
+                }
+                return Ok((h, url.clone()));
+            }
+            Err(e) => {
+                warn!("download failed for {}: {:#}", url, e);
+                last_err = Some(e);
+                // next mirror
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all download mirrors failed")))
 }
 
 /// Download or copy file from ImageSource with hash verification
@@ -214,6 +623,19 @@ async fn download_or_copy_with_hash(
 ) -> Result<()> {
     match source {
         ImageSource::Url(url) => {
+            // Reuse cached download if it matches, otherwise overwrite.
+            if dest.exists() {
+                let existing = match hash_type {
+                    ShaType::Sha256 => compute_sha256_streaming(dest).await,
+                    ShaType::Sha512 => compute_sha512_streaming(dest).await,
+                };
+                if let Ok(h) = existing
+                    && h.eq_ignore_ascii_case(expected_hash)
+                {
+                    return Ok(());
+                }
+            }
+
             let computed = download_with_hash(url, dest, hash_type).await?;
             anyhow::ensure!(
                 computed.to_lowercase() == expected_hash.to_lowercase(),
@@ -502,6 +924,7 @@ impl ImageAction for Debian {
         let image_dir = dirs.images.join(name);
 
         let output = tokio::process::Command::new("guestfish")
+            .env("LIBGUESTFS_BACKEND", "direct")
             .arg("--ro")
             .arg("-a")
             .arg(&file_name)
@@ -540,6 +963,7 @@ impl ImageAction for Debian {
 
         let kernel_src = format!("/boot/{}", kernel_name);
         let output = tokio::process::Command::new("virt-copy-out")
+            .env("LIBGUESTFS_BACKEND", "direct")
             .arg("-a")
             .arg(&file_name)
             .arg(&kernel_src)
@@ -558,6 +982,7 @@ impl ImageAction for Debian {
 
         let initrd_src = format!("/boot/{}", initrd_name);
         let output = tokio::process::Command::new("virt-copy-out")
+            .env("LIBGUESTFS_BACKEND", "direct")
             .arg("-a")
             .arg(&file_name)
             .arg(&initrd_src)
@@ -655,17 +1080,27 @@ impl ImageAction for Fedora {
         let dirs = QleanDirs::new()?;
         let image_dir = dirs.images.join(name);
 
-        // Fedora 41 Cloud Base image
-        let base_url =
-            "https://download.fedoraproject.org/pub/fedora/linux/releases/41/Cloud/x86_64/images";
+        let resolved = resolve_latest_fedora_cloud_qcow2().await?;
+        debug!(
+            "Resolved Fedora Cloud qcow2 (sha256={}): {} mirror(s)",
+            resolved.sha256,
+            resolved.urls.len()
+        );
 
-        // Image filename
-        let image_filename = "Fedora-Cloud-Base-Generic-41-1.4.x86_64.qcow2";
-
-        // Download qcow2 image
-        let qcow2_url = format!("{}/{}", base_url, image_filename);
+        // Download + verify sha256 in one pass.
         let qcow2_path = image_dir.join(format!("{}.qcow2", name));
-        download_file(&qcow2_url, &qcow2_path).await?;
+        let (_hash, used_url) = download_with_hash_multi(
+            &resolved.urls,
+            &qcow2_path,
+            ShaType::Sha256,
+            Some(&resolved.sha256),
+        )
+        .await
+        .with_context(|| "failed to download Fedora cloud image from all mirrors")?;
+        debug!(
+            "Fedora cloud image downloaded successfully from {}",
+            used_url
+        );
 
         // Fedora cloud images don't provide pre-extracted boot files
         // We'll need to extract them using guestfish
@@ -679,6 +1114,7 @@ impl ImageAction for Fedora {
 
         // Use guestfish to list boot files
         let output = tokio::process::Command::new("guestfish")
+            .env("LIBGUESTFS_BACKEND", "direct")
             .arg("--ro")
             .arg("-a")
             .arg(&file_name)
@@ -718,6 +1154,7 @@ impl ImageAction for Fedora {
         // Extract kernel
         let kernel_src = format!("/boot/{}", kernel_name);
         let output = tokio::process::Command::new("virt-copy-out")
+            .env("LIBGUESTFS_BACKEND", "direct")
             .arg("-a")
             .arg(&file_name)
             .arg(&kernel_src)
@@ -737,6 +1174,7 @@ impl ImageAction for Fedora {
         // Extract initrd
         let initrd_src = format!("/boot/{}", initrd_name);
         let output = tokio::process::Command::new("virt-copy-out")
+            .env("LIBGUESTFS_BACKEND", "direct")
             .arg("-a")
             .arg(&file_name)
             .arg(&initrd_src)
@@ -776,14 +1214,24 @@ impl ImageAction for Arch {
         let dirs = QleanDirs::new()?;
         let image_dir = dirs.images.join(name);
 
-        // Arch Linux cloud image (using latest)
-        let base_url = "https://geo.mirror.pkgbuild.com/images/latest";
-        let image_filename = "Arch-Linux-x86_64-cloudimg.qcow2";
+        let resolved = resolve_latest_arch_cloudimg().await?;
+        debug!(
+            "Resolved Arch cloudimg (sha256={}): {} mirror(s)",
+            resolved.sha256,
+            resolved.urls.len()
+        );
 
-        // Download qcow2 image
-        let qcow2_url = format!("{}/{}", base_url, image_filename);
+        // Download + verify sha256 in one pass.
         let qcow2_path = image_dir.join(format!("{}.qcow2", name));
-        download_file(&qcow2_url, &qcow2_path).await?;
+        let (_hash, used_url) = download_with_hash_multi(
+            &resolved.urls,
+            &qcow2_path,
+            ShaType::Sha256,
+            Some(&resolved.sha256),
+        )
+        .await
+        .with_context(|| "failed to download Arch cloud image from all mirrors")?;
+        debug!("Arch cloud image downloaded successfully from {}", used_url);
 
         Ok(())
     }
@@ -795,6 +1243,7 @@ impl ImageAction for Arch {
 
         // Use guestfish to list boot files
         let output = tokio::process::Command::new("guestfish")
+            .env("LIBGUESTFS_BACKEND", "direct")
             .arg("--ro")
             .arg("-a")
             .arg(&file_name)
@@ -835,6 +1284,7 @@ impl ImageAction for Arch {
         // Extract kernel
         let kernel_src = format!("/boot/{}", kernel_name);
         let output = tokio::process::Command::new("virt-copy-out")
+            .env("LIBGUESTFS_BACKEND", "direct")
             .arg("-a")
             .arg(&file_name)
             .arg(&kernel_src)
@@ -854,6 +1304,7 @@ impl ImageAction for Arch {
         // Extract initrd
         let initrd_src = format!("/boot/{}", initrd_name);
         let output = tokio::process::Command::new("virt-copy-out")
+            .env("LIBGUESTFS_BACKEND", "direct")
             .arg("-a")
             .arg(&file_name)
             .arg(&initrd_src)
@@ -959,6 +1410,7 @@ impl ImageAction for Custom {
         let file_name = format!("{}.qcow2", name);
 
         let output = tokio::process::Command::new("guestfish")
+            .env("LIBGUESTFS_BACKEND", "direct")
             .arg("--ro")
             .arg("-a")
             .arg(&file_name)
@@ -996,6 +1448,7 @@ impl ImageAction for Custom {
                 for (file, desc) in [(&kernel, "kernel"), (&initrd, "initrd")] {
                     let src = format!("/boot/{}", file);
                     let output = tokio::process::Command::new("virt-copy-out")
+                        .env("LIBGUESTFS_BACKEND", "direct")
                         .arg("-a")
                         .arg(&file_name)
                         .arg(&src)
@@ -1202,6 +1655,22 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    fn test_subscriber_init() {
+        // Keep test logging setup local to this module to avoid coupling
+        // image unit tests to integration-test helpers.
+        use std::sync::Once;
+        use tracing_subscriber::{EnvFilter, fmt::time::LocalTime};
+
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::from_default_env())
+                .with_timer(LocalTime::rfc_3339())
+                .try_init()
+                .ok();
+        });
+    }
+
     #[test]
     fn test_find_sha512_for_exact_filename() {
         let checksums = "\
@@ -1213,18 +1682,6 @@ f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea6770915
             result,
             Some("f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea67709154d84220059672758508afbb0691c41ba8aa6d76818d89d65".to_string())
         );
-    }
-
-    #[test]
-    fn test_distro_enum_variants() {
-        let variants = vec![
-            Distro::Debian,
-            Distro::Ubuntu,
-            Distro::Fedora,
-            Distro::Arch,
-            Distro::Custom,
-        ];
-        assert_eq!(variants.len(), 5);
     }
 
     #[test]
@@ -1242,8 +1699,42 @@ f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea6770915
         let json = serde_json::to_string(&config).unwrap();
         let decoded: CustomImageConfig = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(decoded.image_hash, "abcdef123456");
-        assert_eq!(decoded.kernel_hash, Some("kernel123".to_string()));
+        assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn test_find_hash_for_file_formats() {
+        // Format 1: "<hex>  <filename>"
+        let f1 = "abc123  foo.bin\n012345  bar.bin";
+        assert_eq!(
+            find_hash_for_file(f1, "bar.bin"),
+            Some("012345".to_string())
+        );
+
+        // Format 2: "SHA256 (<filename>) = <hex>"
+        let f2 = "SHA256 (image.qcow2) = deadbeef\nSHA256 (other) = 00";
+        assert_eq!(
+            find_hash_for_file(f2, "image.qcow2"),
+            Some("deadbeef".to_string())
+        );
+
+        // Format 2: SHA512 variant
+        let f3 = "SHA512 (k) = aaa\nSHA512 (initrd.img) = bbb";
+        assert_eq!(
+            find_hash_for_file(f3, "initrd.img"),
+            Some("bbb".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_fedora_cloud_listing() {
+        let html = r#"
+            <a href=\"Fedora-Cloud-43-1.6-x86_64-CHECKSUM\">Fedora-Cloud-43-1.6-x86_64-CHECKSUM</a>
+            <a href=\"Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2\">Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2</a>
+        "#;
+        let (qcow2, checksum) = parse_fedora_cloud_listing(html, "43").unwrap();
+        assert_eq!(qcow2, "Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2");
+        assert_eq!(checksum, "Fedora-Cloud-43-1.6-x86_64-CHECKSUM");
     }
 
     #[tokio::test]
@@ -1298,6 +1789,59 @@ f0442f3cd0087a609ecd5241109ddef0cbf4a1e05372e13d82c97fc77b35b2d8ecff85aea6770915
         let stream = compute_sha512_streaming(&path).await?;
 
         assert_eq!(shell, stream, "streaming must match shell");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_custom_image_nonexistent_local_path() -> Result<()> {
+        test_subscriber_init();
+
+        let config = CustomImageConfig {
+            image_source: ImageSource::LocalPath(PathBuf::from("/nonexistent/image.qcow2")),
+            image_hash: "fakehash".to_string(),
+            image_hash_type: ShaType::Sha256,
+            kernel_source: None,
+            kernel_hash: None,
+            initrd_source: None,
+            initrd_hash: None,
+        };
+
+        let result = create_custom_image("test-nonexistent", config).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("does not exist"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_custom_image_hash_mismatch() -> Result<()> {
+        test_subscriber_init();
+
+        let tmp = tempfile::NamedTempFile::new()?;
+        let path = tmp.path().to_path_buf();
+
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&path)?;
+            f.write_all(b"test content")?;
+        }
+
+        let config = CustomImageConfig {
+            image_source: ImageSource::LocalPath(path),
+            image_hash: "wronghash123".to_string(),
+            image_hash_type: ShaType::Sha256,
+            kernel_source: None,
+            kernel_hash: None,
+            initrd_source: None,
+            initrd_hash: None,
+        };
+
+        let result = create_custom_image("test-hash-mismatch", config).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("hash mismatch"));
 
         Ok(())
     }
