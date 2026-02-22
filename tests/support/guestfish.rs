@@ -14,22 +14,22 @@ fn has_cmd(cmd: &str) -> bool {
 /// Some distros require libguestfs (guestfish/virt-copy-out) to extract kernel/initrd from qcow2.
 ///
 /// Note: On WSL and other minimal environments, libguestfs can *exist* but fail at runtime because
-/// `supermin` cannot find a host kernel image under /boot. In that case we skip and print remediation.
+/// `supermin` cannot find a usable host kernel/appliance. In that case we skip and print remediation.
 pub fn has_guestfish_tools() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| has_guestfish_tools_inner())
+    *CACHED.get_or_init(has_guestfish_tools_inner)
 }
 
 fn has_guestfish_tools_inner() -> bool {
     if !(has_cmd("guestfish") && has_cmd("virt-copy-out")) {
         eprintln!(
-            "SKIP: Fedora/Arch extraction requires `guestfish` and `virt-copy-out` (package: libguestfs-tools).\n\
+            "SKIP: extraction requires `guestfish` and `virt-copy-out` (package: libguestfs-tools).\n\
 Install with: sudo apt install -y libguestfs-tools"
         );
         return false;
     }
 
-    // libguestfs can use a prebuilt appliance. If one is present, we're usually good.
+    // Prefer a prebuilt appliance if present.
     let appliance_kernel_candidates = [
         "/usr/lib/guestfs/appliance/kernel",
         "/usr/lib64/guestfs/appliance/kernel",
@@ -39,7 +39,6 @@ Install with: sudo apt install -y libguestfs-tools"
         .iter()
         .any(|p| Path::new(p).exists())
     {
-        // On WSL, even with tools installed, runtime can still fail. Probe in that case.
         return if is_wsl() {
             probe_libguestfs_runtime()
         } else {
@@ -47,7 +46,7 @@ Install with: sudo apt install -y libguestfs-tools"
         };
     }
 
-    // Otherwise it will try to build an appliance via supermin, which requires a host kernel image.
+    // Otherwise, supermin needs a host kernel image.
     let has_host_kernel = Path::new("/boot/vmlinuz").exists()
         || std::fs::read_dir("/boot")
             .map(|it| {
@@ -86,12 +85,10 @@ fn is_wsl() -> bool {
 }
 
 fn probe_libguestfs_runtime() -> bool {
-    // If the test tool isn't present, we can't reliably probe; fall back to the heuristic checks.
     if !has_cmd("libguestfs-test-tool") {
         return true;
     }
 
-    // Use the system `timeout` if available to avoid hanging CI/WSL runs.
     let use_timeout = has_cmd("timeout");
     let mut cmd = if use_timeout {
         let mut c = Command::new("timeout");

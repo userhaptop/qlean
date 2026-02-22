@@ -3,10 +3,16 @@ use qlean::{Distro, MachineConfig, create_image, with_machine};
 use serial_test::serial;
 use std::{str, time::Duration};
 
-mod common;
+#[path = "support/e2e.rs"]
+mod e2e;
+#[path = "support/guestfish.rs"]
 mod guestfish;
-use common::{should_run_vm_tests, tracing_subscriber_init};
+#[path = "support/logging.rs"]
+mod logging;
+
+use e2e::should_run_vm_tests;
 use guestfish::has_guestfish_tools;
+use logging::tracing_subscriber_init;
 
 #[tokio::test]
 #[serial]
