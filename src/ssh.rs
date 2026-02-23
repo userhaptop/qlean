@@ -458,7 +458,7 @@ pub async fn connect_ssh(
     // On some hosts (notably WSL2), vsock can be flaky/unreachable even when /dev/vhost-vsock
     // exists. In those cases we want to fall back quickly to TCP host forwarding.
     let vsock_timeout = if tcp_port.is_some() {
-        std::cmp::min(timeout, Duration::from_secs(15))
+        std::cmp::min(timeout, Duration::from_secs(30))
     } else {
         timeout
     };

@@ -132,6 +132,16 @@ pub fn find_hash_for_file(checksums_text: &str, filename: &str) -> Option<String
     None
 }
 
+async fn fetch_ubuntu_sha256sums(base_url: &str) -> Result<String> {
+    let sums_url = format!("{}SHA256SUMS", base_url);
+    fetch_text(&sums_url).await
+}
+
+fn ubuntu_sha256_for(checksums: &str, filename: &str) -> Result<String> {
+    find_hash_for_file(checksums, filename)
+        .with_context(|| format!("Ubuntu SHA256SUMS did not contain hash for {}", filename))
+}
+
 async fn fetch_text(url: &str) -> Result<String> {
     // Keep metadata fetches snappy: if a mirror is slow/hung, we fall back.
     let client = reqwest::Client::builder()
@@ -1052,27 +1062,48 @@ impl ImageAction for Ubuntu {
 
         // Ubuntu noble (24.04 LTS) cloud image base URL
         let base_url = "https://cloud-images.ubuntu.com/noble/current";
+        let checksums = fetch_ubuntu_sha256sums(&format!("{}/", base_url)).await?;
 
-        // Download qcow2 image
-        let qcow2_url = format!("{}/noble-server-cloudimg-amd64.img", base_url);
+        // Download qcow2 image (SHA256 verified)
+        let qcow2_name = "noble-server-cloudimg-amd64.img";
+        let qcow2_url = format!("{}/{}", base_url, qcow2_name);
         let qcow2_path = image_dir.join(format!("{}.qcow2", name));
-        download_file(&qcow2_url, &qcow2_path).await?;
+        let qcow2_sha = ubuntu_sha256_for(&checksums, qcow2_name)?;
+        download_or_copy_with_hash(
+            &ImageSource::Url(qcow2_url),
+            &qcow2_path,
+            &qcow2_sha,
+            ShaType::Sha256,
+        )
+        .await?;
 
-        // Download pre-extracted kernel
-        let kernel_url = format!(
-            "{}/unpacked/noble-server-cloudimg-amd64-vmlinuz-generic",
-            base_url
-        );
+        // Download pre-extracted kernel (SHA256 verified)
+        let kernel_name = "noble-server-cloudimg-amd64-vmlinuz-generic";
+        let kernel_url = format!("{}/unpacked/{}", base_url, kernel_name);
         let kernel_path = image_dir.join("vmlinuz");
-        download_file(&kernel_url, &kernel_path).await?;
+        let kernel_sha = ubuntu_sha256_for(&checksums, &format!("unpacked/{}", kernel_name))
+            .or_else(|_| ubuntu_sha256_for(&checksums, kernel_name))?;
+        download_or_copy_with_hash(
+            &ImageSource::Url(kernel_url),
+            &kernel_path,
+            &kernel_sha,
+            ShaType::Sha256,
+        )
+        .await?;
 
-        // Download pre-extracted initrd
-        let initrd_url = format!(
-            "{}/unpacked/noble-server-cloudimg-amd64-initrd-generic",
-            base_url
-        );
+        // Download pre-extracted initrd (SHA256 verified)
+        let initrd_name = "noble-server-cloudimg-amd64-initrd-generic";
+        let initrd_url = format!("{}/unpacked/{}", base_url, initrd_name);
         let initrd_path = image_dir.join("initrd.img");
-        download_file(&initrd_url, &initrd_path).await?;
+        let initrd_sha = ubuntu_sha256_for(&checksums, &format!("unpacked/{}", initrd_name))
+            .or_else(|_| ubuntu_sha256_for(&checksums, initrd_name))?;
+        download_or_copy_with_hash(
+            &ImageSource::Url(initrd_url),
+            &initrd_path,
+            &initrd_sha,
+            ShaType::Sha256,
+        )
+        .await?;
 
         Ok(())
     }
@@ -1520,27 +1551,6 @@ impl ImageAction for Custom {
 }
 
 // Helper function to download a file
-async fn download_file(url: &str, dest: &PathBuf) -> Result<()> {
-    debug!("Downloading {} to {}", url, dest.display());
-    let response = reqwest::get(url)
-        .await
-        .with_context(|| format!("failed to download from {}", url))?;
-
-    let mut file = File::create(dest)
-        .await
-        .with_context(|| format!("failed to create file at {}", dest.display()))?;
-
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.with_context(|| "failed to read chunk from stream")?;
-        file.write_all(&chunk)
-            .await
-            .with_context(|| "failed to write to file")?;
-    }
-
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Image wrapper enum
 // ---------------------------------------------------------------------------

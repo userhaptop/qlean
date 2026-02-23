@@ -35,7 +35,7 @@ pub struct Machine {
     /// SSH session
     ssh: Option<Session>,
     cid: u32,
-    /// Host-forwarded TCP port for SSH (used as a fallback when vsock is unavailable).
+    /// Host-forwarded TCP port reserved at startup and used as an SSH fallback when vsock is unavailable.
     ssh_tcp_port: u16,
     /// QEMU process ID
     pid: Option<u32>,

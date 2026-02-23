@@ -65,10 +65,8 @@ pub fn should_run_vm_tests() -> bool {
     }
     if !has_vhost_vsock() {
         eprintln!(
-            "SKIP: vhost-vsock not available on this kernel (/dev/vhost-vsock or /sys/module/vhost_vsock missing).\n\
-Qlean currently uses vsock for SSH; enable the vhost_vsock kernel module or run on a host that provides it."
+            "INFO: vhost-vsock not available on this kernel; E2E can still run using TCP SSH fallback."
         );
-        return false;
     }
 
     if is_wsl() {
