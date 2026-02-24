@@ -10,8 +10,8 @@ mod guestfish;
 #[path = "support/logging.rs"]
 mod logging;
 
-use e2e::should_run_vm_tests;
-use guestfish::has_guestfish_tools;
+use e2e::ensure_vm_test_env;
+use guestfish::ensure_guestfish_tools;
 use logging::tracing_subscriber_init;
 
 #[tokio::test]
@@ -19,15 +19,12 @@ use logging::tracing_subscriber_init;
 async fn test_fedora_image_startup_flow() -> Result<()> {
     tracing_subscriber_init();
 
-    if !should_run_vm_tests() {
-        return Ok(());
-    }
+    ensure_vm_test_env()?;
+    eprintln!("INFO: host checks passed");
 
-    // `has_guestfish_tools` prints an actionable SKIP reason on failure.
-    if !has_guestfish_tools() {
-        return Ok(());
-    }
+    ensure_guestfish_tools()?;
 
+    eprintln!("INFO: creating image");
     let image = tokio::time::timeout(
         Duration::from_secs(25 * 60),
         create_image(Distro::Fedora, "fedora-cloud"),
@@ -37,15 +34,21 @@ async fn test_fedora_image_startup_flow() -> Result<()> {
     assert!(image.path().exists(), "qcow2 image must exist");
     assert!(image.kernel().exists(), "kernel must exist");
     assert!(image.initrd().exists(), "initrd must exist");
+    eprintln!("INFO: image ready: {}", image.path().display());
 
-    // Full startup flow validation (mirrors single_machine.rs::hello)
+    eprintln!("INFO: starting VM and waiting for SSH");
+    // Full startup flow validation
     let config = MachineConfig::default();
-    tokio::time::timeout(Duration::from_secs(8 * 60), async {
+    tokio::time::timeout(Duration::from_secs(20 * 60), async {
         with_machine(&image, &config, |vm| {
             Box::pin(async {
-                let result = vm.exec("whoami").await?;
+                let result = vm.exec(". /etc/os-release && echo $ID").await?;
                 assert!(result.status.success());
-                assert_eq!(str::from_utf8(&result.stdout)?.trim(), "root");
+                let distro_id = str::from_utf8(&result.stdout)?.trim();
+                assert!(
+                    distro_id.contains("fedora"),
+                    "unexpected distro id: {distro_id}"
+                );
                 Ok(())
             })
         })

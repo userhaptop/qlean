@@ -113,6 +113,7 @@ impl Session {
     /// Connect to an SSH server via vsock
     async fn connect(
         privkey: PrivateKey,
+        username: &str,
         cid: u32,
         port: u32,
         timeout: Duration,
@@ -128,7 +129,7 @@ impl Session {
 
         let vsock_addr = VsockAddr::new(cid, port);
         let now = Instant::now();
-        info!("🔑 Connecting via vsock");
+        info!("Connecting SSH via vsock");
         let mut session = loop {
             // Check for cancellation
             if cancel_token.is_cancelled() {
@@ -168,8 +169,8 @@ Hint: Qlean uses vhost-vsock for SSH. Ensure /dev/vhost-vsock exists and the hyp
                         continue;
                     }
                     e => {
-                        error!("Unhandled error occurred: {e}");
-                        bail!("Unknown error");
+                        error!("SSH vsock connect error: {e}");
+                        bail!("SSH vsock connect error: {e}");
                     }
                 },
             };
@@ -181,15 +182,17 @@ Hint: Qlean uses vhost-vsock for SSH. Ensure /dev/vhost-vsock exists and the hyp
                     match e.kind() {
                         // The VM is still booting at this point so we're just ignoring these errors
                         // for some time.
-                        ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset => {
+                        ErrorKind::ConnectionRefused
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::UnexpectedEof => {
                             if now.elapsed() > timeout {
                                 warn!("Timeout establishing SSH over vsock");
                                 bail!("Timeout");
                             }
                         }
                         e => {
-                            error!("Unhandled error occurred: {e}");
-                            bail!("Unknown error");
+                            error!("SSH handshake error: {e}");
+                            bail!("SSH handshake error: {e}");
                         }
                     }
                 }
@@ -200,8 +203,8 @@ Hint: Qlean uses vhost-vsock for SSH. Ensure /dev/vhost-vsock exists and the hyp
                     }
                 }
                 Err(e) => {
-                    error!("Unhandled error occurred: {e}");
-                    bail!("Unknown error");
+                    error!("SSH client error: {e}");
+                    bail!("SSH client error: {e}");
                 }
             }
         };
@@ -209,7 +212,10 @@ Hint: Qlean uses vhost-vsock for SSH. Ensure /dev/vhost-vsock exists and the hyp
 
         // use publickey authentication
         let auth_res = session
-            .authenticate_publickey("root", PrivateKeyWithHashAlg::new(Arc::new(privkey), None))
+            .authenticate_publickey(
+                username,
+                PrivateKeyWithHashAlg::new(Arc::new(privkey), None),
+            )
             .await?;
 
         if !auth_res.success() {
@@ -266,33 +272,33 @@ Hint: Qlean uses vhost-vsock for SSH. Ensure /dev/vhost-vsock exists and the hyp
                 bail!("SSH call cancelled");
             }
 
-            // Handle one of the possible events:
-            tokio::select! {
-                // There's an event available on the session channel
-                Some(msg) = channel.wait() => {
-                    match msg {
-                        // Write data to the terminal
-                        ChannelMsg::Data { ref data } => {
-                            stdout.write_all(data).await?;
-                            stdout.flush().await?;
-                        }
-                        ChannelMsg::ExtendedData { ref data, ext } => {
-                            // ext == 1 means it's stderr content
-                            // https://github.com/Eugeny/russh/discussions/258
-                            if ext == 1 {
-                                stderr.write_all(data).await?;
-                                stderr.flush().await?;
-                            }
-                        }
-                        // The command has returned an exit code
-                        ChannelMsg::ExitStatus { exit_status } => {
-                            code = exit_status;
-                            channel.eof().await?;
-                            break;
-                        }
-                        _ => {}
+            let Some(msg) = channel.wait().await else {
+                bail!(
+                    "SSH channel closed before exit status for command: {}",
+                    command
+                );
+            };
+            match msg {
+                // Write data to the terminal
+                ChannelMsg::Data { ref data } => {
+                    stdout.write_all(data).await?;
+                    stdout.flush().await?;
+                }
+                ChannelMsg::ExtendedData { ref data, ext } => {
+                    // ext == 1 means it's stderr content
+                    // https://github.com/Eugeny/russh/discussions/258
+                    if ext == 1 {
+                        stderr.write_all(data).await?;
+                        stderr.flush().await?;
                     }
-                },
+                }
+                // The command has returned an exit code
+                ChannelMsg::ExitStatus { exit_status } => {
+                    code = exit_status;
+                    channel.eof().await?;
+                    break;
+                }
+                _ => {}
             }
         }
         Ok(code)
@@ -318,31 +324,31 @@ Hint: Qlean uses vhost-vsock for SSH. Ensure /dev/vhost-vsock exists and the hyp
                 bail!("SSH call cancelled");
             }
 
-            // Handle one of the possible events:
-            tokio::select! {
-                // There's an event available on the session channel
-                Some(msg) = channel.wait() => {
-                    match msg {
-                        // Write data to the buffer
-                        ChannelMsg::Data { ref data } => {
-                            stdout.extend_from_slice(data);
-                        }
-                        ChannelMsg::ExtendedData { ref data, ext } => {
-                            // ext == 1 means it's stderr content
-                            // https://github.com/Eugeny/russh/discussions/258
-                            if ext == 1 {
-                                stderr.extend_from_slice(data);
-                            }
-                        }
-                        // The command has returned an exit code
-                        ChannelMsg::ExitStatus { exit_status } => {
-                            code = exit_status;
-                            channel.eof().await?;
-                            break;
-                        }
-                        _ => {}
+            let Some(msg) = channel.wait().await else {
+                bail!(
+                    "SSH channel closed before exit status for command: {}",
+                    command
+                );
+            };
+            match msg {
+                // Write data to the buffer
+                ChannelMsg::Data { ref data } => {
+                    stdout.extend_from_slice(data);
+                }
+                ChannelMsg::ExtendedData { ref data, ext } => {
+                    // ext == 1 means it's stderr content
+                    // https://github.com/Eugeny/russh/discussions/258
+                    if ext == 1 {
+                        stderr.extend_from_slice(data);
                     }
-                },
+                }
+                // The command has returned an exit code
+                ChannelMsg::ExitStatus { exit_status } => {
+                    code = exit_status;
+                    channel.eof().await?;
+                    break;
+                }
+                _ => {}
             }
         }
         Ok((code, stdout, stderr))
@@ -358,6 +364,7 @@ Hint: Qlean uses vhost-vsock for SSH. Ensure /dev/vhost-vsock exists and the hyp
     /// Connect to an SSH server via TCP (used as a fallback when vsock is unavailable or flaky).
     async fn connect_tcp(
         privkey: PrivateKey,
+        username: &str,
         host: &str,
         port: u16,
         timeout: Duration,
@@ -408,14 +415,16 @@ Hint: Qlean uses vhost-vsock for SSH. Ensure /dev/vhost-vsock exists and the hyp
             match russh::client::connect_stream(config.clone(), stream, sh.clone()).await {
                 Ok(x) => break x,
                 Err(russh::Error::IO(ref e)) => match e.kind() {
-                    ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset => {
+                    ErrorKind::ConnectionRefused
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::UnexpectedEof => {
                         if now.elapsed() > timeout {
                             bail!("Timeout");
                         }
                     }
                     _ => {
-                        error!("Unhandled error occurred: {e}");
-                        bail!("Unknown error");
+                        error!("SSH vsock connect error: {e}");
+                        bail!("SSH vsock connect error: {e}");
                     }
                 },
                 Err(russh::Error::Disconnect) => {
@@ -424,15 +433,18 @@ Hint: Qlean uses vhost-vsock for SSH. Ensure /dev/vhost-vsock exists and the hyp
                     }
                 }
                 Err(e) => {
-                    error!("Unhandled error occurred: {e}");
-                    bail!("Unknown error");
+                    error!("SSH client error: {e}");
+                    bail!("SSH client error: {e}");
                 }
             }
         };
 
         debug!("Authenticating via SSH");
         let auth_res = session
-            .authenticate_publickey("root", PrivateKeyWithHashAlg::new(Arc::new(privkey), None))
+            .authenticate_publickey(
+                username,
+                PrivateKeyWithHashAlg::new(Arc::new(privkey), None),
+            )
             .await?;
         if !auth_res.success() {
             bail!("Authentication (with publickey) failed");
@@ -453,56 +465,93 @@ pub async fn connect_ssh(
     cancel_token: CancellationToken,
 ) -> Result<Session> {
     let privkey = PrivateKey::from_openssh(&keypair.privkey_str)?;
-
-    // Prefer vsock, but don't wait the full timeout if we have a TCP fallback.
-    // On some hosts (notably WSL2), vsock can be flaky/unreachable even when /dev/vhost-vsock
-    // exists. In those cases we want to fall back quickly to TCP host forwarding.
-    let vsock_timeout = if tcp_port.is_some() {
-        std::cmp::min(timeout, Duration::from_secs(30))
-    } else {
-        timeout
-    };
-
-    let mut ssh = match Session::connect(
-        privkey.clone(),
-        cid,
-        22,
-        vsock_timeout,
-        cancel_token.clone(),
-    )
-    .await
-    {
-        Ok(s) => {
-            info!("✅ Connected via vsock");
-            s
+    let users = [
+        "root",
+        "arch",
+        "fedora",
+        "ubuntu",
+        "debian",
+        "cloud-user",
+        "ec2-user",
+    ];
+    let vsock_supported = std::path::Path::new("/dev/vhost-vsock").exists();
+    let user_count = users.len() as u32;
+    let per_user_timeout = {
+        let slice = timeout / user_count.max(1);
+        let min_t = Duration::from_secs(8);
+        let max_t = Duration::from_secs(20);
+        if slice < min_t {
+            min_t
+        } else if slice > max_t {
+            max_t
+        } else {
+            slice
         }
-        Err(e) => {
-            if let Some(port) = tcp_port {
-                warn!("Vsock SSH failed ({e}). Falling back to tcp 127.0.0.1:{port}");
-                let s =
-                    Session::connect_tcp(privkey, "127.0.0.1", port, timeout, cancel_token.clone())
-                        .await?;
-                info!("✅ Connected via tcp");
-                s
-            } else {
-                return Err(e);
+    };
+    let mut last_tcp_err: Option<anyhow::Error> = None;
+    let mut last_vsock_err: Option<anyhow::Error> = None;
+
+    if let Some(port) = tcp_port {
+        info!("Connecting SSH via tcp 127.0.0.1:{}", port);
+        for user in users {
+            match Session::connect_tcp(
+                privkey.clone(),
+                user,
+                "127.0.0.1",
+                port,
+                per_user_timeout,
+                cancel_token.clone(),
+            )
+            .await
+            {
+                Ok(mut s) => {
+                    info!("✅ Connected via tcp as {}", user);
+                    let _ = s.call("true", cancel_token.clone()).await?;
+                    debug!("SSH command channel is ready");
+                    return Ok(s);
+                }
+                Err(e) => {
+                    warn!("SSH via tcp failed for user {}: {}", user, e);
+                    last_tcp_err = Some(e);
+                }
             }
         }
-    };
+    }
 
-    // First we'll wait until the system has fully booted up.
-    let is_running_exitcode = ssh
-        .call(
-            "systemctl is-system-running --wait --quiet",
+    if !vsock_supported {
+        return Err(last_tcp_err.unwrap_or_else(|| {
+            anyhow::anyhow!("SSH connection failed over tcp and vhost-vsock is unavailable")
+        }));
+    }
+
+    info!("Falling back to vsock SSH");
+    for user in users {
+        match Session::connect(
+            privkey.clone(),
+            user,
+            cid,
+            22,
+            per_user_timeout,
             cancel_token.clone(),
         )
-        .await?;
-    debug!("systemctl is-system-running --wait exit code {is_running_exitcode}");
+        .await
+        {
+            Ok(mut s) => {
+                info!("✅ Connected via vsock as {}", user);
+                let _ = s.call("true", cancel_token.clone()).await?;
+                debug!("SSH command channel is ready");
+                return Ok(s);
+            }
+            Err(e) => {
+                warn!("SSH via vsock failed for user {}: {}", user, e);
+                last_vsock_err = Some(e);
+            }
+        }
+    }
 
-    // Allow the --env option to work by allowing SSH to accept all sent environment variables.
-    // ssh.call("echo AcceptEnv * >> /etc/ssh/sshd_config").await?;
-
-    Ok(ssh)
+    Err(last_vsock_err
+        .or(last_tcp_err)
+        .unwrap_or_else(|| anyhow::anyhow!("SSH connection failed")))
 }
 
 impl Session {

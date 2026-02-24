@@ -8,7 +8,7 @@ mod e2e;
 #[path = "support/logging.rs"]
 mod logging;
 
-use e2e::should_run_vm_tests;
+use e2e::ensure_vm_test_env;
 use logging::tracing_subscriber_init;
 
 #[tokio::test]
@@ -16,11 +16,11 @@ use logging::tracing_subscriber_init;
 async fn test_ubuntu_image_creation() -> Result<()> {
     tracing_subscriber_init();
 
-    if !should_run_vm_tests() {
-        return Ok(());
-    }
+    ensure_vm_test_env()?;
+    eprintln!("INFO: host checks passed");
 
     // Ubuntu  uses pre-extracted kernel/initrd.
+    eprintln!("INFO: creating image");
     let image = tokio::time::timeout(
         Duration::from_secs(15 * 60),
         create_image(Distro::Ubuntu, "ubuntu-noble-cloudimg"),
@@ -30,15 +30,21 @@ async fn test_ubuntu_image_creation() -> Result<()> {
     assert!(image.path().exists(), "qcow2 image must exist");
     assert!(image.kernel().exists(), "kernel must exist");
     assert!(image.initrd().exists(), "initrd must exist");
+    eprintln!("INFO: image ready: {}", image.path().display());
 
-    // Full startup flow validation (mirrors single_machine.rs::hello)
+    eprintln!("INFO: starting VM and waiting for SSH");
+    // Full startup flow validation
     let config = MachineConfig::default();
     tokio::time::timeout(Duration::from_secs(5 * 60), async {
         with_machine(&image, &config, |vm| {
             Box::pin(async {
-                let result = vm.exec("whoami").await?;
+                let result = vm.exec(". /etc/os-release && echo $ID").await?;
                 assert!(result.status.success());
-                assert_eq!(str::from_utf8(&result.stdout)?.trim(), "root");
+                let distro_id = str::from_utf8(&result.stdout)?.trim();
+                assert!(
+                    distro_id.contains("ubuntu"),
+                    "unexpected distro id: {distro_id}"
+                );
                 Ok(())
             })
         })

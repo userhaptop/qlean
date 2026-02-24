@@ -12,7 +12,7 @@ use tokio::{
     time::{Duration, timeout},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     KVM_AVAILABLE, MachineConfig,
@@ -49,12 +49,31 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
                 "vhost-vsock-pci,id=vhost-vsock-pci0,guest-cid={}",
                 params.cid
             ),
-        ])
-        // Kernel
-        .args(["-kernel", params.image.kernel.to_str().unwrap()])
-        .args(["-append", "rw root=/dev/vda1 console=ttyS0"])
-        // Initrd
-        .args(["-initrd", params.image.initrd.to_str().unwrap()])
+        ]);
+
+    let use_direct_kernel_boot = params.image.prefer_direct_kernel_boot
+        && params.image.kernel.exists()
+        && params.image.initrd.exists()
+        && std::fs::metadata(&params.image.kernel)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+        && std::fs::metadata(&params.image.initrd)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+
+    if use_direct_kernel_boot {
+        qemu_cmd
+            .args(["-kernel", params.image.kernel.to_str().unwrap()])
+            .args([
+                "-append",
+                &format!("rw {} console=ttyS0", params.image.root_arg),
+            ])
+            .args(["-initrd", params.image.initrd.to_str().unwrap()]);
+    } else {
+        warn!("Kernel/initrd extraction is unavailable. Booting from qcow2 disk image directly.");
+    }
+
+    qemu_cmd
         // Disk
         .args([
             "-drive",
@@ -76,7 +95,7 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
     // ---------------------------------------------------------------------
     let bridge_name = "qlbr0";
     let ssh_port = params.ssh_tcp_port;
-    let want_bridge = !is_wsl() && has_iface(bridge_name) && bridge_conf_allows(bridge_name);
+    let want_bridge = has_iface(bridge_name) && bridge_conf_allows(bridge_name);
 
     if want_bridge {
         qemu_cmd
@@ -97,15 +116,7 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
                 .args(["-device", "virtio-net-pci,netdev=net1"]);
         }
     } else {
-        if is_wsl() {
-            info!(
-                "WSL detected: disabling bridged networking and using user-mode networking + hostfwd for SSH."
-            );
-        } else {
-            warn!(
-                "Bridged networking is unavailable (missing /etc/qemu/bridge.conf allow, or bridge interface not present). Falling back to user-mode networking + hostfwd."
-            );
-        }
+        warn!("Bridged networking is unavailable. Falling back to user-mode networking + hostfwd.");
 
         let port = ssh_port.ok_or_else(|| {
             anyhow::anyhow!("user-mode networking fallback requires ssh_tcp_port to be set")
@@ -150,7 +161,8 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
     }
 
     // Spawn QEMU process
-    debug!("Spawning QEMU with command:\n{:?}", qemu_cmd.to_string());
+    info!("Starting QEMU");
+    debug!("QEMU command: {:?}", qemu_cmd.to_string());
     let mut qemu_child = qemu_cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -170,7 +182,9 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            trace!("{}", strip_ansi_codes(&line));
+            // QEMU serial stdout is noisy during normal boot.
+            // Keep it available only at debug level.
+            debug!("[qemu] {}", strip_ansi_codes(&line));
         }
     });
 
@@ -180,7 +194,7 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
         let reader = BufReader::new(stderr);
         let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            error!("{}", strip_ansi_codes(&line));
+            error!("[qemu] {}", strip_ansi_codes(&line));
         }
     });
 
@@ -218,16 +232,6 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
     let _ = tokio::join!(stdout_task, stderr_task);
 
     result
-}
-
-fn is_wsl() -> bool {
-    // Best-effort detection for WSL. We avoid hard failures if files are missing.
-    let osrelease = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
-    if osrelease.to_lowercase().contains("microsoft") {
-        return true;
-    }
-    let version = std::fs::read_to_string("/proc/version").unwrap_or_default();
-    version.to_lowercase().contains("microsoft")
 }
 
 fn bridge_conf_allows(bridge: &str) -> bool {

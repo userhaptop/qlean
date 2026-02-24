@@ -9,8 +9,10 @@ use tracing_subscriber::{EnvFilter, fmt::time::LocalTime};
 pub fn tracing_subscriber_init() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,qlean=info"));
         tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env())
+            .with_env_filter(env_filter)
             .with_timer(LocalTime::rfc_3339())
             .try_init()
             .ok();

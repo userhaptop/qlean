@@ -1,13 +1,24 @@
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
-use tokio::{fs::File, io::AsyncWriteExt};
-use tracing::{debug, warn};
+use tokio::{
+    fs::File,
+    io::AsyncWriteExt,
+    time::{Duration, timeout},
+};
+use tracing::{debug, info, warn};
 
 use crate::utils::{QleanDirs, ensure_extraction_prerequisites};
+
+fn default_root_arg() -> String {
+    "root=/dev/vda1".to_string()
+}
 
 pub trait ImageAction {
     /// Download the image from remote source
@@ -27,6 +38,8 @@ pub struct ImageMeta<A: ImageAction> {
     pub path: PathBuf,
     pub kernel: PathBuf,
     pub initrd: PathBuf,
+    #[serde(default = "default_root_arg")]
+    pub root_arg: String,
     #[serde(skip)]
     pub vendor: A,
     pub checksum: ShaSum,
@@ -77,64 +90,183 @@ pub struct CustomImageConfig {
     pub initrd_hash: Option<String>,
 }
 
-/// Parses SHA512SUMS format and returns the hash for an exact filename match.
-///
-/// # Arguments
-/// * `checksums_text` - The content of a SHA512SUMS file
-/// * `filename` - The exact filename to search for (e.g., "debian-13-generic-amd64.qcow2")
-///
-/// # Returns
-/// The SHA512 hash if found, or None if no exact match exists
-pub fn find_sha512_for_file(checksums_text: &str, filename: &str) -> Option<String> {
-    checksums_text.lines().find_map(|line| {
-        let mut parts = line.split_whitespace();
-        let hash = parts.next()?;
-        let fname = parts.next()?;
+/// Normalize checksum entry names across common checksum file formats.
+fn normalize_checksum_name(name: &str) -> &str {
+    name.trim_start_matches('*').trim_start_matches("./")
+}
 
-        (fname == filename).then(|| hash.to_string())
-    })
+fn checksum_name_matches(entry_name: &str, wanted: &str) -> bool {
+    let entry = normalize_checksum_name(entry_name);
+    let wanted = normalize_checksum_name(wanted);
+    if entry == wanted {
+        return true;
+    }
+    if !wanted.contains('/')
+        && let Some(base) = entry.rsplit('/').next()
+    {
+        return base == wanted;
+    }
+    false
+}
+
+/// Parses checksum text and returns the hash for a filename.
+pub fn find_sha512_for_file(checksums_text: &str, filename: &str) -> Option<String> {
+    find_hash_for_file(checksums_text, filename)
 }
 
 /// Parse a checksum file and return the hash for a given filename.
 ///
 /// Supports common formats:
-/// 1) "<hex>  <filename>"
+/// 1) "<hex>  <filename>" (including "*filename" and "./filename")
 /// 2) "SHA256 (<filename>) = <hex>" / "SHA512 (<filename>) = <hex>"
 pub fn find_hash_for_file(checksums_text: &str, filename: &str) -> Option<String> {
-    // Format 1: "<hex>  <filename>"
-    if let Some(h) = checksums_text.lines().find_map(|line| {
-        let mut parts = line.split_whitespace();
-        let hash = parts.next()?;
-        let fname = parts.next()?;
-        (fname == filename).then(|| hash.to_string())
-    }) {
-        return Some(h);
+    let mut parts = checksums_text.split_whitespace();
+    while let Some(hash) = parts.next() {
+        let Some(fname) = parts.next() else { break };
+        if checksum_name_matches(fname, filename) {
+            return Some(hash.to_string());
+        }
     }
 
-    // Format 2: "SHA256 (<filename>) = <hex>" / "SHA512 (<filename>) = <hex>"
     for line in checksums_text.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("SHA256 (")
-            && let Some(rest) = rest.strip_prefix(filename)
-            && let Some(rest) = rest.strip_prefix(") = ")
-        {
-            return Some(rest.trim().to_string());
-        }
-
-        if let Some(rest) = line.strip_prefix("SHA512 (")
-            && let Some(rest) = rest.strip_prefix(filename)
-            && let Some(rest) = rest.strip_prefix(") = ")
-        {
-            return Some(rest.trim().to_string());
+        for prefix in ["SHA256 (", "SHA512 ("] {
+            if let Some(rest) = line.strip_prefix(prefix)
+                && let Some((entry_name, hash_part)) = rest.split_once(") = ")
+                && checksum_name_matches(entry_name, filename)
+            {
+                return Some(hash_part.trim().to_string());
+            }
         }
     }
 
     None
 }
 
+fn join_url(base: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
 async fn fetch_ubuntu_sha256sums(base_url: &str) -> Result<String> {
-    let sums_url = format!("{}SHA256SUMS", base_url);
-    fetch_text(&sums_url).await
+    let primary = join_url(base_url, "SHA256SUMS");
+    match fetch_text(&primary).await {
+        Ok(text) => Ok(text),
+        Err(primary_err) => {
+            let fallback = join_url(base_url, "SHA256SUMS.txt");
+            fetch_text(&fallback).await.with_context(|| {
+                format!(
+                    "failed to fetch Ubuntu checksums from {} or {} ({:#})",
+                    primary, fallback, primary_err
+                )
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedUbuntuCloudImage {
+    base_url: String,
+    disk_name: String,
+    kernel_name: String,
+    initrd_name: String,
+    disk_sha256: String,
+    kernel_sha256: Option<String>,
+    initrd_sha256: Option<String>,
+}
+
+fn pick_existing_ubuntu_name(checksums: &str, candidates: &[&str]) -> Option<String> {
+    candidates
+        .iter()
+        .find(|name| {
+            checksums.contains(&format!(" {}", name)) || checksums.contains(&format!(" *{}", name))
+        })
+        .map(|name| (*name).to_string())
+}
+
+async fn resolve_ubuntu_noble_cloudimg() -> Result<ResolvedUbuntuCloudImage> {
+    let bases = [
+        "https://cloud-images.ubuntu.com/releases/noble/release",
+        "https://cloud-images.ubuntu.com/noble/current",
+        "https://cloud-images.ubuntu.com/daily/server/releases/noble/release",
+    ];
+
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for (idx, base) in bases.iter().enumerate() {
+        info!("Ubuntu metadata source {}/{}", idx + 1, bases.len());
+
+        let checksums = match fetch_ubuntu_sha256sums(base).await {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+
+        let disk_name = match pick_existing_ubuntu_name(
+            &checksums,
+            &[
+                "ubuntu-24.04-server-cloudimg-amd64.img",
+                "noble-server-cloudimg-amd64.img",
+            ],
+        ) {
+            Some(v) => v,
+            None => {
+                last_err = Some(anyhow::anyhow!(
+                    "Ubuntu SHA256SUMS did not contain amd64 cloud image entry"
+                ));
+                continue;
+            }
+        };
+
+        let stem = disk_name.strip_suffix(".img").unwrap_or(&disk_name);
+        let kernel_name = format!("{}-vmlinuz-generic", stem);
+        let initrd_name = format!("{}-initrd-generic", stem);
+
+        let disk_sha256 = match ubuntu_sha256_for(&checksums, &disk_name) {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let kernel_sha256 = ubuntu_sha256_for(&checksums, &format!("unpacked/{}", kernel_name))
+            .or_else(|_| ubuntu_sha256_for(&checksums, &kernel_name))
+            .ok();
+        if kernel_sha256.is_none() {
+            warn!(
+                "Ubuntu SHA256SUMS did not include kernel checksum for {}; proceeding without kernel hash verification",
+                kernel_name
+            );
+        }
+
+        let initrd_sha256 = ubuntu_sha256_for(&checksums, &format!("unpacked/{}", initrd_name))
+            .or_else(|_| ubuntu_sha256_for(&checksums, &initrd_name))
+            .ok();
+        if initrd_sha256.is_none() {
+            warn!(
+                "Ubuntu SHA256SUMS did not include initrd checksum for {}; proceeding without initrd hash verification",
+                initrd_name
+            );
+        }
+
+        return Ok(ResolvedUbuntuCloudImage {
+            base_url: (*base).to_string(),
+            disk_name,
+            kernel_name,
+            initrd_name,
+            disk_sha256,
+            kernel_sha256,
+            initrd_sha256,
+        });
+    }
+
+    Err(last_err
+        .unwrap_or_else(|| anyhow::anyhow!("failed to resolve Ubuntu cloud image metadata")))
 }
 
 fn ubuntu_sha256_for(checksums: &str, filename: &str) -> Result<String> {
@@ -383,43 +515,56 @@ fn parse_fedora_cloud_listing(listing_html: &str, ver: &str) -> Result<(String, 
 ///
 /// Arch publishes stable "latest" URLs plus a sidecar .SHA256 file.
 async fn resolve_latest_arch_cloudimg() -> Result<ResolvedRemote> {
-    // Multiple mirrors; any could stall. We fetch SHA256 from the first
-    // available mirror (sidecar is identical across mirrors).
     let bases = [
+        "https://mirrors.tuna.tsinghua.edu.cn/archlinux/images/latest",
+        "https://mirrors.ustc.edu.cn/archlinux/images/latest",
+        "https://mirrors.sjtug.sjtu.edu.cn/archlinux/images/latest",
+        "https://fastly.mirror.pkgbuild.com/images/latest",
         "https://geo.mirror.pkgbuild.com/images/latest",
-        "https://mirrors.kernel.org/archlinux/images/latest",
-        "https://mirror.rackspace.com/archlinux/images/latest",
+        "https://mirror.citrahost.com/archlinux/images/latest",
+        "https://mirrors.teamcloud.am/archlinux/images/latest",
+        "https://mirror.umd.edu/archlinux/images/latest",
+        "https://ftp.jaist.ac.jp/pub/Linux/ArchLinux/images/latest",
     ];
     let filename = "Arch-Linux-x86_64-cloudimg.qcow2";
 
-    let mut sha_text: Option<String> = None;
-    let mut good_bases: Vec<String> = Vec::new();
-    for base in &bases {
+    info!("Resolving Arch cloud image metadata");
+
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut selected_base: Option<&str> = None;
+    let mut sha256: Option<String> = None;
+
+    for (idx, base) in bases.iter().enumerate() {
+        info!("Arch metadata mirror {}/{}", idx + 1, bases.len());
         let sha_url = format!("{}/{}.SHA256", base, filename);
         match fetch_text(&sha_url).await {
-            Ok(t) => {
-                good_bases.push(base.to_string());
-                if sha_text.is_none() {
-                    sha_text = Some(t);
+            Ok(text) => {
+                if let Some(hash) = find_hash_for_file(&text, filename) {
+                    selected_base = Some(*base);
+                    sha256 = Some(hash);
+                    break;
                 }
+                last_err = Some(anyhow::anyhow!("invalid checksum format at {}", sha_url));
             }
-            Err(e) => debug!("Arch SHA256 fetch failed for {}: {:#}", sha_url, e),
+            Err(e) => {
+                debug!("Arch metadata fetch failed for {}: {:#}", sha_url, e);
+                last_err = Some(e);
+            }
         }
     }
 
-    anyhow::ensure!(
-        !good_bases.is_empty(),
-        "failed to fetch Arch cloud image SHA256 from mirrors"
-    );
+    let selected_base = selected_base.ok_or_else(|| {
+        last_err.unwrap_or_else(|| anyhow::anyhow!("no Arch mirror metadata succeeded"))
+    })?;
+    let sha256 = sha256.expect("sha256 must exist when metadata resolves");
 
-    let sha_text = sha_text.unwrap();
-    let sha256 = find_hash_for_file(&sha_text, filename)
-        .with_context(|| "could not parse Arch .SHA256 file")?;
+    let mut urls = vec![format!("{}/{}", selected_base, filename)];
+    for base in bases {
+        if base != selected_base {
+            urls.push(format!("{}/{}", base, filename));
+        }
+    }
 
-    let urls = good_bases
-        .into_iter()
-        .map(|base| format!("{}/{}", base, filename))
-        .collect::<Vec<_>>();
     Ok(ResolvedRemote { urls, sha256 })
 }
 
@@ -505,14 +650,18 @@ pub async fn download_with_hash(
         .build()
         .with_context(|| "failed to build HTTP client")?;
 
-    let response = client
-        .get(url)
-        .send()
+    info!("Downloading image from {}", url);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(30), client.get(url).send())
         .await
+        .with_context(|| format!("timed out before response headers from {}", url))?
         .with_context(|| format!("failed to download from {}", url))?;
 
     let status = response.status();
+    let total_size = response.content_length();
     anyhow::ensure!(status.is_success(), "GET {} failed: {}", url, status);
+    if let Some(total) = total_size {
+        info!("Remote size: {} MiB ({})", total / (1024 * 1024), url);
+    }
 
     // Ensure destination directory exists.
     if let Some(parent) = tmp_path.parent() {
@@ -529,13 +678,15 @@ pub async fn download_with_hash(
         .with_context(|| format!("failed to create file at {}", tmp_path.display()))?;
 
     let mut stream = response.bytes_stream();
-    let idle = std::time::Duration::from_secs(30);
+    let idle = std::time::Duration::from_secs(60);
     let mut downloaded: u64 = 0;
     let mut last_report: u64 = 0;
     // Report download progress in reasonably small increments. On slower links (or in CI/WSL),
     // 64MiB can take long enough that the test runner prints a scary "running over 60 seconds"
     // warning with no other output.
-    let report_step: u64 = 16 * 1024 * 1024; // 16 MiB
+    let report_step: u64 = 8 * 1024 * 1024; // 8 MiB
+    let started_at = std::time::Instant::now();
+    let mut last_report_at = started_at;
 
     let hash = match hash_type {
         ShaType::Sha256 => {
@@ -549,9 +700,37 @@ pub async fn download_with_hash(
                 let Some(chunk) = next else { break };
                 let chunk = chunk.with_context(|| "failed to read chunk")?;
                 downloaded += chunk.len() as u64;
-                if downloaded - last_report >= report_step {
+                let now = std::time::Instant::now();
+                if downloaded - last_report >= report_step
+                    || (downloaded > 0
+                        && now.duration_since(last_report_at) >= std::time::Duration::from_secs(10))
+                {
                     last_report = downloaded;
-                    debug!("Downloading {}: {} MiB", url, downloaded / (1024 * 1024));
+                    last_report_at = now;
+                    if let Some(total) = total_size {
+                        info!(
+                            "Download progress: {}/{} MiB ({})",
+                            downloaded / (1024 * 1024),
+                            total / (1024 * 1024),
+                            url
+                        );
+                    } else {
+                        info!(
+                            "Download progress: {} MiB ({})",
+                            downloaded / (1024 * 1024),
+                            url
+                        );
+                    }
+                }
+                if started_at.elapsed() >= std::time::Duration::from_secs(90)
+                    && downloaded < 32 * 1024 * 1024
+                {
+                    anyhow::bail!(
+                        "download too slow for {} ({} MiB in {:?}); trying next mirror",
+                        url,
+                        downloaded / (1024 * 1024),
+                        started_at.elapsed()
+                    );
                 }
                 h.update(&chunk);
                 file.write_all(&chunk)
@@ -571,9 +750,37 @@ pub async fn download_with_hash(
                 let Some(chunk) = next else { break };
                 let chunk = chunk.with_context(|| "failed to read chunk")?;
                 downloaded += chunk.len() as u64;
-                if downloaded - last_report >= report_step {
+                let now = std::time::Instant::now();
+                if downloaded - last_report >= report_step
+                    || (downloaded > 0
+                        && now.duration_since(last_report_at) >= std::time::Duration::from_secs(10))
+                {
                     last_report = downloaded;
-                    debug!("Downloading {}: {} MiB", url, downloaded / (1024 * 1024));
+                    last_report_at = now;
+                    if let Some(total) = total_size {
+                        info!(
+                            "Download progress: {}/{} MiB ({})",
+                            downloaded / (1024 * 1024),
+                            total / (1024 * 1024),
+                            url
+                        );
+                    } else {
+                        info!(
+                            "Download progress: {} MiB ({})",
+                            downloaded / (1024 * 1024),
+                            url
+                        );
+                    }
+                }
+                if started_at.elapsed() >= std::time::Duration::from_secs(90)
+                    && downloaded < 32 * 1024 * 1024
+                {
+                    anyhow::bail!(
+                        "download too slow for {} ({} MiB in {:?}); trying next mirror",
+                        url,
+                        downloaded / (1024 * 1024),
+                        started_at.elapsed()
+                    );
                 }
                 h.update(&chunk);
                 file.write_all(&chunk)
@@ -597,6 +804,11 @@ pub async fn download_with_hash(
             )
         })?;
 
+    info!(
+        "Download complete: {} MiB ({})",
+        downloaded / (1024 * 1024),
+        url
+    );
     Ok(hash)
 }
 
@@ -630,6 +842,7 @@ pub async fn download_with_hash_multi(
             }
         }
 
+        info!("Trying mirror {}/{}", idx + 1, urls.len());
         debug!("Download attempt {}/{}: {}", idx + 1, urls.len(), url);
         match download_with_hash(url, dest_path, hash_type.clone()).await {
             Ok(h) => {
@@ -712,6 +925,23 @@ async fn download_or_copy_with_hash(
     Ok(())
 }
 
+/// Download or copy file from ImageSource without hash verification.
+async fn download_or_copy_without_hash(source: &ImageSource, dest: &PathBuf) -> Result<()> {
+    match source {
+        ImageSource::Url(url) => {
+            if dest.exists() {
+                return Ok(());
+            }
+            let _ = download_with_hash(url, dest, ShaType::Sha256).await?;
+        }
+        ImageSource::LocalPath(src) => {
+            anyhow::ensure!(src.exists(), "file does not exist: {}", src.display());
+            tokio::fs::copy(src, dest).await?;
+        }
+    }
+    Ok(())
+}
+
 impl<A: ImageAction + std::default::Default> ImageMeta<A> {
     /// Create a new image by downloading and extracting
     pub async fn create(name: &str) -> Result<Self> {
@@ -734,9 +964,12 @@ impl<A: ImageAction + std::default::Default> ImageMeta<A> {
 
         distro_action.download(name).await?;
 
-        let (kernel, initrd) = distro_action.extract(name).await?;
         let image_path = image_dir.join(format!("{}.qcow2", name));
+        let (kernel, initrd) = distro_action.extract(name).await?;
         let checksum_path = image_dir.join("checksums");
+        let root_arg = detect_root_arg(&image_path)
+            .await
+            .unwrap_or_else(|_| default_root_arg());
         let checksum = ShaSum {
             path: checksum_path,
             sha_type: ShaType::Sha512,
@@ -745,6 +978,7 @@ impl<A: ImageAction + std::default::Default> ImageMeta<A> {
             path: image_path,
             kernel,
             initrd,
+            root_arg,
             checksum,
             name: name.to_string(),
             vendor: distro_action,
@@ -766,6 +1000,18 @@ impl<A: ImageAction + std::default::Default> ImageMeta<A> {
 
         let image: ImageMeta<A> = serde_json::from_str(&json_content)
             .with_context(|| format!("failed to parse JSON from {}", json_path.display()))?;
+
+        let kernel_ok = image.kernel.exists()
+            && std::fs::metadata(&image.kernel)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
+        let initrd_ok = image.initrd.exists()
+            && std::fs::metadata(&image.initrd)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
+        if !kernel_ok || !initrd_ok {
+            bail!("cached image is missing kernel/initrd markers; recreate is required");
+        }
 
         let checksum_dir = dirs.images.join(name);
         let checksum_command = match image.checksum.sha_type {
@@ -868,9 +1114,12 @@ impl<A: ImageAction> ImageMeta<A> {
 
         action.download(name).await?;
 
-        let (kernel, initrd) = action.extract(name).await?;
         let image_path = image_dir.join(format!("{}.qcow2", name));
+        let (kernel, initrd) = action.extract(name).await?;
         let checksum_path = image_dir.join("checksums");
+        let root_arg = detect_root_arg(&image_path)
+            .await
+            .unwrap_or_else(|_| default_root_arg());
         let checksum = ShaSum {
             path: checksum_path,
             sha_type: ShaType::Sha512,
@@ -879,6 +1128,7 @@ impl<A: ImageAction> ImageMeta<A> {
             path: image_path,
             kernel,
             initrd,
+            root_arg,
             checksum,
             name: name.to_string(),
             vendor: action,
@@ -915,6 +1165,185 @@ impl<A: ImageAction> ImageMeta<A> {
 
         Ok(image)
     }
+}
+
+async fn ensure_fixed_guestfs_appliance() -> Result<PathBuf> {
+    for dir in [
+        "/usr/lib/guestfs/appliance",
+        "/usr/lib/x86_64-linux-gnu/guestfs/appliance",
+    ] {
+        let p = PathBuf::from(dir);
+        if p.join("kernel").exists() && p.join("initrd").exists() {
+            return Ok(p);
+        }
+    }
+
+    let dirs = QleanDirs::new()?;
+    let appliance_dir = dirs.base.join("guestfs-appliance");
+    if appliance_dir.join("kernel").exists() && appliance_dir.join("initrd").exists() {
+        return Ok(appliance_dir);
+    }
+
+    let output = tokio::process::Command::new("libguestfs-make-fixed-appliance")
+        .arg(&appliance_dir)
+        .output()
+        .await
+        .with_context(|| "failed to execute libguestfs-make-fixed-appliance")?;
+    if !output.status.success() {
+        bail!(
+            "libguestfs fixed appliance build failed: {}\nInstall package: libguestfs-appliance (or libguestfs-tools) and retry.",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(appliance_dir)
+}
+
+async fn run_guestfs_tool(
+    program: &str,
+    args: &[&OsStr],
+    current_dir: &Path,
+) -> Result<std::process::Output> {
+    async fn run_once(
+        program: &str,
+        args: &[&OsStr],
+        current_dir: &Path,
+        appliance: Option<&Path>,
+    ) -> Result<std::process::Output> {
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.env("LIBGUESTFS_BACKEND", "direct")
+            .current_dir(current_dir);
+        if let Some(appliance_dir) = appliance {
+            cmd.env("LIBGUESTFS_PATH", appliance_dir);
+        }
+        for a in args {
+            cmd.arg(a);
+        }
+        let child = cmd.output();
+        let out = timeout(Duration::from_secs(180), child)
+            .await
+            .with_context(|| format!("{} timed out after 180s (libguestfs)", program))?
+            .with_context(|| format!("failed to execute {}", program))?;
+        Ok(out)
+    }
+
+    let first = run_once(program, args, current_dir, None).await?;
+    if !first.status.success() {
+        warn!(
+            "{} failed (direct backend): {}",
+            program,
+            String::from_utf8_lossy(&first.stderr)
+        );
+    }
+    if first.status.success() {
+        return Ok(first);
+    }
+
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    let needs_fixed = stderr.contains("supermin exited with error status")
+        || stderr.contains("/usr/bin/supermin");
+    if needs_fixed && std::env::var_os("LIBGUESTFS_PATH").is_none() {
+        let appliance_dir = ensure_fixed_guestfs_appliance().await?;
+        return run_once(program, args, current_dir, Some(&appliance_dir)).await;
+    }
+
+    Ok(first)
+}
+
+async fn guestfish_ls_boot(image_dir: &Path, file_name: &str) -> Result<String> {
+    let args = [
+        OsStr::new("--ro"),
+        OsStr::new("-a"),
+        OsStr::new(file_name),
+        OsStr::new("-i"),
+        OsStr::new("ls"),
+        OsStr::new("/boot"),
+    ];
+    let output = run_guestfs_tool("guestfish", &args, image_dir).await?;
+    if !output.status.success() {
+        bail!(
+            "guestfish failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+async fn virt_copy_out(image_dir: &Path, file_name: &str, src: &str, kind: &str) -> Result<()> {
+    let args = [
+        OsStr::new("-a"),
+        OsStr::new(file_name),
+        OsStr::new(src),
+        OsStr::new("."),
+    ];
+    let output = run_guestfs_tool("virt-copy-out", &args, image_dir).await?;
+    if !output.status.success() {
+        bail!(
+            "virt-copy-out failed for {}: {}",
+            kind,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+async fn write_unavailable_boot_artifacts(
+    image_dir: &Path,
+    reason: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    let kernel = image_dir.join("vmlinuz.unavailable");
+    let initrd = image_dir.join("initrd.img.unavailable");
+    let note = format!("qlean boot artifact unavailable: {}\n", reason);
+
+    tokio::fs::write(&kernel, note.as_bytes())
+        .await
+        .with_context(|| format!("failed to write {}", kernel.display()))?;
+    tokio::fs::write(&initrd, note.as_bytes())
+        .await
+        .with_context(|| format!("failed to write {}", initrd.display()))?;
+
+    Ok((kernel, initrd))
+}
+
+async fn detect_root_arg(image_path: &Path) -> Result<String> {
+    let image_dir = image_path.parent().with_context(|| "missing image dir")?;
+    let file_name = image_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .with_context(|| "invalid image filename")?;
+    let args = [
+        OsStr::new("--ro"),
+        OsStr::new("-a"),
+        OsStr::new(file_name),
+        OsStr::new("-i"),
+        OsStr::new("mountpoints"),
+    ];
+    let output = run_guestfs_tool("guestfish", &args, image_dir).await?;
+    if !output.status.success() {
+        return Ok(default_root_arg());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let mut dev = None;
+        if parts[0].starts_with("/dev/") && parts[1] == "/" {
+            dev = Some(parts[0]);
+        }
+        if parts[1].starts_with("/dev/") && parts[0] == "/" {
+            dev = Some(parts[1]);
+        }
+        if let Some(d) = dev {
+            let virt = if let Some(rest) = d.strip_prefix("/dev/sd") {
+                format!("/dev/vd{}", rest)
+            } else {
+                d.to_string()
+            };
+            return Ok(format!("root={}", virt));
+        }
+    }
+    Ok(default_root_arg())
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,50 +1501,55 @@ impl ImageAction for Ubuntu {
         let dirs = QleanDirs::new()?;
         let image_dir = dirs.images.join(name);
 
-        // Ubuntu noble (24.04 LTS) cloud image base URL
-        let base_url = "https://cloud-images.ubuntu.com/noble/current";
-        let checksums = fetch_ubuntu_sha256sums(&format!("{}/", base_url)).await?;
+        let resolved = resolve_ubuntu_noble_cloudimg().await?;
+        debug!(
+            "Resolved Ubuntu cloud image from {}: disk={}, kernel={}, initrd={}",
+            resolved.base_url, resolved.disk_name, resolved.kernel_name, resolved.initrd_name
+        );
 
-        // Download qcow2 image (SHA256 verified)
-        let qcow2_name = "noble-server-cloudimg-amd64.img";
-        let qcow2_url = format!("{}/{}", base_url, qcow2_name);
         let qcow2_path = image_dir.join(format!("{}.qcow2", name));
-        let qcow2_sha = ubuntu_sha256_for(&checksums, qcow2_name)?;
+        let qcow2_url = join_url(&resolved.base_url, &resolved.disk_name);
         download_or_copy_with_hash(
             &ImageSource::Url(qcow2_url),
             &qcow2_path,
-            &qcow2_sha,
+            &resolved.disk_sha256,
             ShaType::Sha256,
         )
         .await?;
 
-        // Download pre-extracted kernel (SHA256 verified)
-        let kernel_name = "noble-server-cloudimg-amd64-vmlinuz-generic";
-        let kernel_url = format!("{}/unpacked/{}", base_url, kernel_name);
         let kernel_path = image_dir.join("vmlinuz");
-        let kernel_sha = ubuntu_sha256_for(&checksums, &format!("unpacked/{}", kernel_name))
-            .or_else(|_| ubuntu_sha256_for(&checksums, kernel_name))?;
-        download_or_copy_with_hash(
-            &ImageSource::Url(kernel_url),
-            &kernel_path,
-            &kernel_sha,
-            ShaType::Sha256,
-        )
-        .await?;
+        let kernel_url = join_url(
+            &resolved.base_url,
+            &format!("unpacked/{}", resolved.kernel_name),
+        );
+        if let Some(kernel_sha256) = resolved.kernel_sha256.as_deref() {
+            download_or_copy_with_hash(
+                &ImageSource::Url(kernel_url),
+                &kernel_path,
+                kernel_sha256,
+                ShaType::Sha256,
+            )
+            .await?;
+        } else {
+            download_or_copy_without_hash(&ImageSource::Url(kernel_url), &kernel_path).await?;
+        }
 
-        // Download pre-extracted initrd (SHA256 verified)
-        let initrd_name = "noble-server-cloudimg-amd64-initrd-generic";
-        let initrd_url = format!("{}/unpacked/{}", base_url, initrd_name);
         let initrd_path = image_dir.join("initrd.img");
-        let initrd_sha = ubuntu_sha256_for(&checksums, &format!("unpacked/{}", initrd_name))
-            .or_else(|_| ubuntu_sha256_for(&checksums, initrd_name))?;
-        download_or_copy_with_hash(
-            &ImageSource::Url(initrd_url),
-            &initrd_path,
-            &initrd_sha,
-            ShaType::Sha256,
-        )
-        .await?;
+        let initrd_url = join_url(
+            &resolved.base_url,
+            &format!("unpacked/{}", resolved.initrd_name),
+        );
+        if let Some(initrd_sha256) = resolved.initrd_sha256.as_deref() {
+            download_or_copy_with_hash(
+                &ImageSource::Url(initrd_url),
+                &initrd_path,
+                initrd_sha256,
+                ShaType::Sha256,
+            )
+            .await?;
+        } else {
+            download_or_copy_without_hash(&ImageSource::Url(initrd_url), &initrd_path).await?;
+        }
 
         Ok(())
     }
@@ -1158,7 +1592,6 @@ impl ImageAction for Fedora {
             resolved.urls.len()
         );
 
-        // Download + verify sha256 in one pass.
         let qcow2_path = image_dir.join(format!("{}.qcow2", name));
         let (_hash, used_url) = download_with_hash_multi(
             &resolved.urls,
@@ -1173,8 +1606,6 @@ impl ImageAction for Fedora {
             used_url
         );
 
-        // Fedora cloud images don't provide pre-extracted boot files
-        // We'll need to extract them using guestfish
         Ok(())
     }
 
@@ -1185,89 +1616,49 @@ impl ImageAction for Fedora {
         let dirs = QleanDirs::new()?;
         let image_dir = dirs.images.join(name);
 
-        // Use guestfish to list boot files
-        let output = tokio::process::Command::new("guestfish")
-            .env("LIBGUESTFS_BACKEND", "direct")
-            .arg("--ro")
-            .arg("-a")
-            .arg(&file_name)
-            .arg("-i")
-            .arg("ls")
-            .arg("/boot")
-            .current_dir(&image_dir)
-            .output()
-            .await
-            .with_context(|| "failed to execute guestfish")?;
+        let extract_result = async {
+            let boot_files = guestfish_ls_boot(&image_dir, &file_name)
+                .await
+                .with_context(|| "failed to read /boot from Fedora image with guestfish")?;
+            let mut kernel_name = None;
+            let mut initrd_name = None;
 
-        if !output.status.success() {
-            bail!(
-                "guestfish failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            for line in boot_files.lines() {
+                let file = line.trim();
+                if file.starts_with("vmlinuz") {
+                    kernel_name = Some(file.to_string());
+                } else if file.starts_with("initramfs") {
+                    initrd_name = Some(file.to_string());
+                }
+            }
+
+            let kernel_name =
+                kernel_name.with_context(|| "failed to find kernel file (vmlinuz*) in /boot")?;
+            let initrd_name =
+                initrd_name.with_context(|| "failed to find initrd file (initramfs*) in /boot")?;
+
+            let kernel_src = format!("/boot/{}", kernel_name);
+            virt_copy_out(&image_dir, &file_name, &kernel_src, "kernel").await?;
+
+            let initrd_src = format!("/boot/{}", initrd_name);
+            virt_copy_out(&image_dir, &file_name, &initrd_src, "initrd").await?;
+
+            let kernel_path = image_dir.join(&kernel_name);
+            let initrd_path = image_dir.join(&initrd_name);
+            Ok::<(PathBuf, PathBuf), anyhow::Error>((kernel_path, initrd_path))
         }
+        .await;
 
-        let boot_files = String::from_utf8_lossy(&output.stdout);
-        let mut kernel_name = None;
-        let mut initrd_name = None;
-
-        for line in boot_files.lines() {
-            let file = line.trim();
-            if file.starts_with("vmlinuz") {
-                kernel_name = Some(file.to_string());
-            } else if file.starts_with("initramfs") {
-                initrd_name = Some(file.to_string());
+        match extract_result {
+            Ok(paths) => Ok(paths),
+            Err(e) => {
+                warn!(
+                    "Fedora kernel/initrd extraction failed: {:#}. Using disk boot fallback.",
+                    e
+                );
+                write_unavailable_boot_artifacts(&image_dir, "fedora extraction failed").await
             }
         }
-
-        let kernel_name =
-            kernel_name.with_context(|| "failed to find kernel file (vmlinuz*) in /boot")?;
-        let initrd_name =
-            initrd_name.with_context(|| "failed to find initrd file (initramfs*) in /boot")?;
-
-        // Extract kernel
-        let kernel_src = format!("/boot/{}", kernel_name);
-        let output = tokio::process::Command::new("virt-copy-out")
-            .env("LIBGUESTFS_BACKEND", "direct")
-            .arg("-a")
-            .arg(&file_name)
-            .arg(&kernel_src)
-            .arg(".")
-            .current_dir(&image_dir)
-            .output()
-            .await
-            .with_context(|| format!("failed to execute virt-copy-out for {}", kernel_name))?;
-
-        if !output.status.success() {
-            bail!(
-                "virt-copy-out failed for kernel: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        // Extract initrd
-        let initrd_src = format!("/boot/{}", initrd_name);
-        let output = tokio::process::Command::new("virt-copy-out")
-            .env("LIBGUESTFS_BACKEND", "direct")
-            .arg("-a")
-            .arg(&file_name)
-            .arg(&initrd_src)
-            .arg(".")
-            .current_dir(&image_dir)
-            .output()
-            .await
-            .with_context(|| format!("failed to execute virt-copy-out for {}", initrd_name))?;
-
-        if !output.status.success() {
-            bail!(
-                "virt-copy-out failed for initrd: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        let kernel_path = image_dir.join(&kernel_name);
-        let initrd_path = image_dir.join(&initrd_name);
-
-        Ok((kernel_path, initrd_path))
     }
 
     fn distro(&self) -> Distro {
@@ -1294,7 +1685,6 @@ impl ImageAction for Arch {
             resolved.urls.len()
         );
 
-        // Download + verify sha256 in one pass.
         let qcow2_path = image_dir.join(format!("{}.qcow2", name));
         let (_hash, used_url) = download_with_hash_multi(
             &resolved.urls,
@@ -1316,90 +1706,49 @@ impl ImageAction for Arch {
         let dirs = QleanDirs::new()?;
         let image_dir = dirs.images.join(name);
 
-        // Use guestfish to list boot files
-        let output = tokio::process::Command::new("guestfish")
-            .env("LIBGUESTFS_BACKEND", "direct")
-            .arg("--ro")
-            .arg("-a")
-            .arg(&file_name)
-            .arg("-i")
-            .arg("ls")
-            .arg("/boot")
-            .current_dir(&image_dir)
-            .output()
-            .await
-            .with_context(|| "failed to execute guestfish")?;
+        let extract_result = async {
+            let boot_files = guestfish_ls_boot(&image_dir, &file_name)
+                .await
+                .with_context(|| "failed to read /boot from Arch image with guestfish")?;
+            let mut kernel_name = None;
+            let mut initrd_name = None;
 
-        if !output.status.success() {
-            bail!(
-                "guestfish failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            for line in boot_files.lines() {
+                let file = line.trim();
+                if file.starts_with("vmlinuz") {
+                    kernel_name = Some(file.to_string());
+                } else if file.starts_with("initramfs") && file.contains("linux.img") {
+                    initrd_name = Some(file.to_string());
+                }
+            }
+
+            let kernel_name =
+                kernel_name.with_context(|| "failed to find kernel file (vmlinuz*) in /boot")?;
+            let initrd_name = initrd_name
+                .with_context(|| "failed to find initrd file (initramfs*linux.img) in /boot")?;
+
+            let kernel_src = format!("/boot/{}", kernel_name);
+            virt_copy_out(&image_dir, &file_name, &kernel_src, "kernel").await?;
+
+            let initrd_src = format!("/boot/{}", initrd_name);
+            virt_copy_out(&image_dir, &file_name, &initrd_src, "initrd").await?;
+
+            let kernel_path = image_dir.join(&kernel_name);
+            let initrd_path = image_dir.join(&initrd_name);
+            Ok::<(PathBuf, PathBuf), anyhow::Error>((kernel_path, initrd_path))
         }
+        .await;
 
-        let boot_files = String::from_utf8_lossy(&output.stdout);
-        let mut kernel_name = None;
-        let mut initrd_name = None;
-
-        for line in boot_files.lines() {
-            let file = line.trim();
-            // Arch uses vmlinuz-linux
-            if file.starts_with("vmlinuz") {
-                kernel_name = Some(file.to_string());
-            } else if file.starts_with("initramfs") && file.contains("linux.img") {
-                initrd_name = Some(file.to_string());
+        match extract_result {
+            Ok(paths) => Ok(paths),
+            Err(e) => {
+                warn!(
+                    "Arch kernel/initrd extraction failed: {:#}. Using disk boot fallback.",
+                    e
+                );
+                write_unavailable_boot_artifacts(&image_dir, "arch extraction failed").await
             }
         }
-
-        let kernel_name =
-            kernel_name.with_context(|| "failed to find kernel file (vmlinuz*) in /boot")?;
-        let initrd_name = initrd_name
-            .with_context(|| "failed to find initrd file (initramfs*linux.img) in /boot")?;
-
-        // Extract kernel
-        let kernel_src = format!("/boot/{}", kernel_name);
-        let output = tokio::process::Command::new("virt-copy-out")
-            .env("LIBGUESTFS_BACKEND", "direct")
-            .arg("-a")
-            .arg(&file_name)
-            .arg(&kernel_src)
-            .arg(".")
-            .current_dir(&image_dir)
-            .output()
-            .await
-            .with_context(|| format!("failed to execute virt-copy-out for {}", kernel_name))?;
-
-        if !output.status.success() {
-            bail!(
-                "virt-copy-out failed for kernel: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        // Extract initrd
-        let initrd_src = format!("/boot/{}", initrd_name);
-        let output = tokio::process::Command::new("virt-copy-out")
-            .env("LIBGUESTFS_BACKEND", "direct")
-            .arg("-a")
-            .arg(&file_name)
-            .arg(&initrd_src)
-            .arg(".")
-            .current_dir(&image_dir)
-            .output()
-            .await
-            .with_context(|| format!("failed to execute virt-copy-out for {}", initrd_name))?;
-
-        if !output.status.success() {
-            bail!(
-                "virt-copy-out failed for initrd: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-
-        let kernel_path = image_dir.join(&kernel_name);
-        let initrd_path = image_dir.join(&initrd_name);
-
-        Ok((kernel_path, initrd_path))
     }
 
     fn distro(&self) -> Distro {
@@ -1472,89 +1821,41 @@ impl ImageAction for Custom {
         let dirs = QleanDirs::new()?;
         let image_dir = dirs.images.join(name);
 
-        // Check if kernel/initrd were pre-provided
         let kernel_path = image_dir.join("vmlinuz");
         let initrd_path = image_dir.join("initrd.img");
-
         if kernel_path.exists() && initrd_path.exists() {
             debug!("Using pre-provided kernel and initrd files");
             return Ok((kernel_path, initrd_path));
         }
 
-        // Otherwise, try to extract using guestfish
         ensure_extraction_prerequisites().await?;
         let file_name = format!("{}.qcow2", name);
+        let boot_files = guestfish_ls_boot(&image_dir, &file_name).await?;
 
-        let output = tokio::process::Command::new("guestfish")
-            .env("LIBGUESTFS_BACKEND", "direct")
-            .arg("--ro")
-            .arg("-a")
-            .arg(&file_name)
-            .arg("-i")
-            .arg("ls")
-            .arg("/boot")
-            .current_dir(&image_dir)
-            .output()
-            .await;
-
-        if let Ok(output) = output
-            && output.status.success()
-        {
-            let boot_files = String::from_utf8_lossy(&output.stdout);
-            let mut kernel_name = None;
-            let mut initrd_name = None;
-
-            // Generic kernel/initrd detection
-            for line in boot_files.lines() {
-                let file = line.trim();
-                if kernel_name.is_none()
-                    && (file.starts_with("vmlinuz") || file.starts_with("bzImage"))
-                {
-                    kernel_name = Some(file.to_string());
-                }
-                if initrd_name.is_none()
-                    && (file.starts_with("initrd") || file.starts_with("initramfs"))
-                {
-                    initrd_name = Some(file.to_string());
-                }
+        let mut kernel_name = None;
+        let mut initrd_name = None;
+        for line in boot_files.lines() {
+            let file = line.trim();
+            if kernel_name.is_none() && (file.starts_with("vmlinuz") || file.starts_with("bzImage"))
+            {
+                kernel_name = Some(file.to_string());
             }
-
-            if let (Some(kernel), Some(initrd)) = (kernel_name, initrd_name) {
-                // Extract using virt-copy-out
-                for (file, desc) in [(&kernel, "kernel"), (&initrd, "initrd")] {
-                    let src = format!("/boot/{}", file);
-                    let output = tokio::process::Command::new("virt-copy-out")
-                        .env("LIBGUESTFS_BACKEND", "direct")
-                        .arg("-a")
-                        .arg(&file_name)
-                        .arg(&src)
-                        .arg(".")
-                        .current_dir(&image_dir)
-                        .output()
-                        .await?;
-
-                    if !output.status.success() {
-                        bail!("virt-copy-out failed for {}", desc);
-                    }
-                }
-
-                return Ok((image_dir.join(&kernel), image_dir.join(&initrd)));
+            if initrd_name.is_none()
+                && (file.starts_with("initrd") || file.starts_with("initramfs"))
+            {
+                initrd_name = Some(file.to_string());
             }
         }
 
-        // Guestfish not available or failed - provide helpful error
-        bail!(
-            "Custom image requires either:\n\
-             \n\
-             1. Pre-extracted boot files (RECOMMENDED for WSL):\n\
-                - Provide kernel_source, kernel_hash, initrd_source, initrd_hash in config\n\
-                - See documentation for examples\n\
-             \n\
-             2. Guestfish for extraction (native Linux only):\n\
-                - Install: sudo apt install libguestfs-tools\n\
-                - Provide only image_source/image_hash in config\n\
-                - Not supported on WSL/WSL2"
-        );
+        let kernel = kernel_name.with_context(|| "failed to find kernel file in /boot")?;
+        let initrd = initrd_name.with_context(|| "failed to find initrd file in /boot")?;
+
+        let kernel_src = format!("/boot/{}", kernel);
+        virt_copy_out(&image_dir, &file_name, &kernel_src, "kernel").await?;
+        let initrd_src = format!("/boot/{}", initrd);
+        virt_copy_out(&image_dir, &file_name, &initrd_src, "initrd").await?;
+
+        Ok((image_dir.join(&kernel), image_dir.join(&initrd)))
     }
 
     fn distro(&self) -> Distro {
@@ -1619,6 +1920,23 @@ impl Image {
             Image::Fedora(img) => &img.initrd,
             Image::Arch(img) => &img.initrd,
             Image::Custom(img) => &img.initrd,
+        }
+    }
+
+    pub fn root_arg(&self) -> &str {
+        match self {
+            Image::Debian(img) => &img.root_arg,
+            Image::Ubuntu(img) => &img.root_arg,
+            Image::Fedora(img) => &img.root_arg,
+            Image::Arch(img) => &img.root_arg,
+            Image::Custom(img) => &img.root_arg,
+        }
+    }
+
+    pub fn prefer_direct_kernel_boot(&self) -> bool {
+        match self {
+            Image::Debian(_) | Image::Ubuntu(_) => true,
+            Image::Fedora(_) | Image::Arch(_) | Image::Custom(_) => false,
         }
     }
 }

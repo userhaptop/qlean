@@ -56,6 +56,8 @@ pub struct MachineImage {
     pub kernel: PathBuf,
     pub initrd: PathBuf,
     pub seed: PathBuf,
+    pub root_arg: String,
+    pub prefer_direct_kernel_boot: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -188,6 +190,8 @@ impl Machine {
             kernel: image.kernel().to_owned(),
             initrd: image.initrd().to_owned(),
             seed: seed_iso_path,
+            root_arg: image.root_arg().to_string(),
+            prefer_direct_kernel_boot: image.prefer_direct_kernel_boot(),
         };
 
         Ok(Self {
@@ -282,15 +286,32 @@ impl Machine {
     /// Shutdown the machine
     pub async fn shutdown(&mut self) -> Result<()> {
         if let Some(ssh) = self.ssh.as_mut() {
-            // Then shut the system down.
-            ssh.call(
-                "systemctl poweroff",
-                self.ssh_cancel_token
-                    .as_ref()
-                    .expect("Machine not initialized or spawned")
-                    .clone(),
-            )
-            .await?;
+            // Then shut the system down. Try several commands because some cloud images
+            // (notably Arch) log in as an unprivileged default user and plain
+            // `systemctl poweroff` can fail with "Access denied".
+            let shutdown_cmd = r#"sh -lc 'systemctl poweroff \
+                || sudo -n systemctl poweroff \
+                || sudo -n poweroff \
+                || poweroff \
+                || shutdown -h now \
+                || sudo -n shutdown -h now'"#;
+            if let Err(e) = ssh
+                .call(
+                    shutdown_cmd,
+                    self.ssh_cancel_token
+                        .as_ref()
+                        .expect("Machine not initialized or spawned")
+                        .clone(),
+                )
+                .await
+            {
+                // During shutdown the SSH session can drop before the command fully returns.
+                // Keep going and rely on the QEMU process wait/cleanup below.
+                debug!(
+                    "Guest shutdown command returned error during teardown: {}",
+                    e
+                );
+            }
             info!("🔌 Shutting down VM-{}", self.id);
 
             // Tell the QEMU handler it's now fine to wait for exit.
