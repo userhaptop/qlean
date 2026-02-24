@@ -179,6 +179,8 @@ struct ResolvedRemote {
 ///
 /// This endpoint is stable and returns structured JSON. We select the first
 /// release entry where `isMaintained=true` and `isEol=false`.
+const FALLBACK_FEDORA_RELEASE: &str = "43";
+
 async fn resolve_latest_fedora_release() -> Result<String> {
     #[derive(Deserialize)]
     struct EolResp {
@@ -199,19 +201,29 @@ async fn resolve_latest_fedora_release() -> Result<String> {
 
     // Public JSON API documented on https://endoflife.date/fedora
     let url = "https://endoflife.date/api/v1/products/fedora/";
-    let body = fetch_text(url).await?;
-    let parsed: EolResp =
-        serde_json::from_str(&body).with_context(|| "failed to parse Fedora release JSON")?;
+    match fetch_text(url).await {
+        Ok(body) => {
+            let parsed: EolResp = serde_json::from_str(&body)
+                .with_context(|| "failed to parse Fedora release JSON")?;
 
-    let latest = parsed
-        .result
-        .releases
-        .into_iter()
-        .find(|r| r.is_maintained && !r.is_eol)
-        .map(|r| r.name)
-        .with_context(|| "could not determine latest maintained Fedora release")?;
+            let latest = parsed
+                .result
+                .releases
+                .into_iter()
+                .find(|r| r.is_maintained && !r.is_eol)
+                .map(|r| r.name)
+                .with_context(|| "could not determine latest maintained Fedora release")?;
 
-    Ok(latest)
+            Ok(latest)
+        }
+        Err(err) => {
+            warn!(
+                "failed to query endoflife.date for latest Fedora release ({}); falling back to {}",
+                err, FALLBACK_FEDORA_RELEASE
+            );
+            Ok(FALLBACK_FEDORA_RELEASE.to_string())
+        }
+    }
 }
 
 /// Resolve the latest Fedora Cloud Base Generic qcow2 URL and its SHA256.
