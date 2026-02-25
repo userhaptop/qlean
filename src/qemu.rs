@@ -54,13 +54,20 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
     let use_direct_kernel_boot = params.image.prefer_direct_kernel_boot
         && params.image.kernel.exists()
         && params.image.initrd.exists()
-        && std::fs::metadata(&params.image.kernel).map(|m| m.len() > 0).unwrap_or(false)
-        && std::fs::metadata(&params.image.initrd).map(|m| m.len() > 0).unwrap_or(false);
+        && std::fs::metadata(&params.image.kernel)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+        && std::fs::metadata(&params.image.initrd)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
 
     if use_direct_kernel_boot {
         qemu_cmd
             .args(["-kernel", params.image.kernel.to_str().unwrap()])
-            .args(["-append", &format!("rw {} console=ttyS0", params.image.root_arg)])
+            .args([
+                "-append",
+                &format!("rw {} console=ttyS0", params.image.root_arg),
+            ])
             .args(["-initrd", params.image.initrd.to_str().unwrap()]);
     } else {
         warn!("Kernel/initrd extraction is unavailable. Booting from qcow2 disk image directly.");
@@ -109,9 +116,7 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
                 .args(["-device", "virtio-net-pci,netdev=net1"]);
         }
     } else {
-        warn!(
-            "Bridged networking is unavailable. Falling back to user-mode networking + hostfwd."
-        );
+        warn!("Bridged networking is unavailable. Falling back to user-mode networking + hostfwd.");
 
         let port = ssh_port.ok_or_else(|| {
             anyhow::anyhow!("user-mode networking fallback requires ssh_tcp_port to be set")
@@ -226,7 +231,6 @@ pub async fn launch_qemu(params: QemuLaunchParams) -> anyhow::Result<()> {
 
     result
 }
-
 
 fn bridge_conf_allows(bridge: &str) -> bool {
     // qemu-bridge-helper enforces an ACL file (commonly /etc/qemu/bridge.conf).
