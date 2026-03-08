@@ -148,7 +148,9 @@ pub async fn ensure_prerequisites() -> Result<()> {
 /// Ensure prerequisites for extracting kernel/initrd from disk images.
 ///
 /// This is only required for distros/custom modes that need libguestfs-based
-/// extraction (guestfish/virt-copy-out).
+/// extraction (guestfish/virt-copy-out). Qlean relies on the host's
+/// libguestfs-tools installation and does not provision fallback appliances at
+/// runtime.
 pub async fn ensure_extraction_prerequisites() -> Result<()> {
     check_command_available("guestfish").await?;
     check_command_available("virt-copy-out").await?;

@@ -103,9 +103,23 @@ maybe_install_guestfs_tools_ubuntu() {
   apt-get install -y libguestfs-tools
 }
 
+verify_guestfs_runtime() {
+  if ! command -v libguestfs-test-tool >/dev/null 2>&1; then
+    echo "WARN: libguestfs-test-tool not found after installation. Check your libguestfs-tools package." >&2
+    return
+  fi
+
+  echo "INFO: Verifying host libguestfs runtime (LIBGUESTFS_BACKEND=direct libguestfs-test-tool)"
+  if ! LIBGUESTFS_BACKEND=direct libguestfs-test-tool; then
+    echo "ERROR: libguestfs-test-tool failed. Fix the host libguestfs-tools installation before using Qlean image extraction." >&2
+    exit 1
+  fi
+}
+
 need_root
 ensure_bridge_conf
 ensure_bridge_helper_caps
 maybe_install_guestfs_tools_ubuntu
+verify_guestfs_runtime
 
 echo "DONE"
