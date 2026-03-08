@@ -3,14 +3,16 @@ set -euo pipefail
 
 # Qlean host prerequisites helper.
 #
-# This script is intentionally conservative: it configures QEMU bridge-helper
-# permissions for the Qlean bridge and applies the minimal capabilities needed
-# for qemu-bridge-helper.
+# This script configures the explicit host prerequisites required by Qlean:
+#   - qemu-bridge-helper permissions for the Qlean bridge
+#   - the libvirt 'qlean' network and qlbr0 bridge
+#   - host libguestfs-tools installation/runtime verification
 #
-# It does *not* create the bridge or manage network state (that remains the
-# responsibility of Qlean at runtime).
+# Qlean no longer provisions or discovers fallback paths at runtime; run this
+# script once before using distro image creation or E2E tests.
 
 BRIDGE_NAME="${QLEAN_BRIDGE_NAME:-qlbr0}"
+VIRSH_URI="qemu:///system"
 
 need_root() {
   if [[ "$(id -u)" -ne 0 ]]; then
@@ -42,7 +44,6 @@ ensure_bridge_conf() {
 }
 
 find_qemu_bridge_helper() {
-  # Common distro paths.
   local candidates=(
     /usr/lib/qemu/qemu-bridge-helper
     /usr/libexec/qemu-bridge-helper
@@ -56,7 +57,6 @@ find_qemu_bridge_helper() {
     fi
   done
 
-  # Fall back to PATH.
   if command -v qemu-bridge-helper >/dev/null 2>&1; then
     command -v qemu-bridge-helper
     return 0
@@ -73,7 +73,6 @@ ensure_bridge_helper_caps() {
   fi
 
   if command -v setcap >/dev/null 2>&1; then
-    # Prefer file capabilities over setuid.
     chmod u-s "$helper" || true
     setcap cap_net_admin+ep "$helper"
 
@@ -86,14 +85,47 @@ ensure_bridge_helper_caps() {
   fi
 }
 
+ensure_qlean_network() {
+  if ! command -v virsh >/dev/null 2>&1; then
+    echo "ERROR: virsh not found. Install libvirt-clients/libvirt-daemon-system first." >&2
+    exit 1
+  fi
+
+  if ! virsh -c "$VIRSH_URI" net-info qlean >/dev/null 2>&1; then
+    local xml
+    xml=$(mktemp)
+    cat > "$xml" <<EOF
+<network>
+  <name>qlean</name>
+  <bridge name='${BRIDGE_NAME}'/>
+  <forward mode='nat'/>
+  <ip address='192.168.221.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='192.168.221.2' end='192.168.221.254'/>
+    </dhcp>
+  </ip>
+</network>
+EOF
+    echo "INFO: defining libvirt network qlean"
+    virsh -c "$VIRSH_URI" net-define "$xml"
+    rm -f "$xml"
+  else
+    echo "OK: libvirt network qlean already defined"
+  fi
+
+  echo "INFO: ensuring libvirt network qlean is active"
+  virsh -c "$VIRSH_URI" net-start qlean >/dev/null 2>&1 || true
+  virsh -c "$VIRSH_URI" net-autostart qlean >/dev/null 2>&1 || true
+}
+
 maybe_install_guestfs_tools_ubuntu() {
-  # Only attempt package installation on Debian/Ubuntu when apt-get is available.
   if ! command -v apt-get >/dev/null 2>&1; then
     return
   fi
 
-  # guestfish/virt-copy-out are used for kernel/initrd extraction.
-  if command -v guestfish >/dev/null 2>&1 && command -v virt-copy-out >/dev/null 2>&1; then
+  if command -v guestfish >/dev/null 2>&1 \
+    && command -v virt-copy-out >/dev/null 2>&1 \
+    && command -v libguestfs-test-tool >/dev/null 2>&1; then
     echo "OK: libguestfs tools already installed"
     return
   fi
@@ -119,6 +151,7 @@ verify_guestfs_runtime() {
 need_root
 ensure_bridge_conf
 ensure_bridge_helper_caps
+ensure_qlean_network
 maybe_install_guestfs_tools_ubuntu
 verify_guestfs_runtime
 

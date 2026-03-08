@@ -19,9 +19,7 @@ use logging::tracing_subscriber_init;
 async fn test_arch_image_startup_flow() -> Result<()> {
     tracing_subscriber_init();
 
-    if !ensure_vm_test_env()? {
-        return Ok(());
-    }
+    ensure_vm_test_env()?;
 
     eprintln!("INFO: host checks passed");
 

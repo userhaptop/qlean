@@ -207,8 +207,8 @@ async fn ensure_network() -> Result<()> {
         .output()
         .await
         .context("failed to execute virsh to check qlean network")?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let all_networks = stdout.lines().collect::<HashSet<_>>();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let all_networks = stdout.lines().map(str::to_owned).collect::<HashSet<_>>();
     let net_exists = all_networks.contains("qlean");
 
     let output = tokio::process::Command::new("virsh")
@@ -219,8 +219,8 @@ async fn ensure_network() -> Result<()> {
         .output()
         .await
         .context("failed to execute virsh to check qlean network")?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let active_networks = stdout.lines().collect::<HashSet<_>>();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let active_networks = stdout.lines().map(str::to_owned).collect::<HashSet<_>>();
     let net_active = active_networks.contains("qlean");
 
     if !net_exists {
